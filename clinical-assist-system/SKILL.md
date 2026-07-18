@@ -1,7 +1,7 @@
 ---
 name: clinical-assist-system
 description: "寿县和华医院临床AI辅助系统（RAG + vLLM + DIP匹配）的调试记录、当前状态、已知问题和修复方案。任何智能体对系统进行修改后，必须更新此技能。"
-version: 1.4.0
+version: 1.6.0
 author: hehua
 platforms: [linux, macos, windows]
 ---
@@ -34,11 +34,19 @@ platforms: [linux, macos, windows]
 
 ## 已知问题
 
-### 1. LLM推理速度慢（100-130秒）
-- **原因**: Qwen3-32B NVFP4 在 GB10 上生成约 10 tokens/s，临床分析需输出 800-1300 tokens
-- **已做优化**: 精简system prompt（合规分析结构简化+指令精简）, 病程记录 100-200字→30-60字, 添加[TIMER]计时日志定位瓶颈
-- **待做**: vLLM 加 `--enable-prefix-caching` (需重启，阻塞于日间有活跃用户), 可节约10-15s
-- **瓶颈**: 硬件限制，软件优化后从~130s降至~100s(提速24%)
+### 1. LLM推理速度慢（优化后~99s，原始~130s）
+- **原因**: Qwen3-32B NVFP4 在 GB10 上生成约 10 tokens/s
+- **已做优化**: 精简system prompt + TIMER计时（提速24%）
+- **待做**: vLLM 加 `--enable-prefix-caching`，预计再省10-15s
+- **详细分析**: 见 `references/prefix-caching-analysis.md`（利弊/操作/替代方案）
+
+## 参考文档
+
+| 文档 | 路径 | 说明 |
+|:--|:--|:--|
+| Prefix Caching 分析 | `references/prefix-caching-analysis.md` | vLLM prefix caching 利弊、操作、替代方案 |
+| 中医融合方案 | `references/tcm-nihaixia-fusion-plan.md` | nihaixia 中医 Skill 融合到临床系统 |
+| 中医测试报告 | `references/tcm-nihaixia-test-results.md` | 4项效果测试 + 融合建议 |
 
 ### 2. 讯飞Spark API Key 授权失效
 - **报错**: `AppIdNoAuthError (code=11200)`
@@ -50,6 +58,17 @@ platforms: [linux, macos, windows]
 - **状态**: 当前未使用
 
 ## 系统架构
+
+## Skills 分发仓库
+
+⚡ **GitHub**: https://github.com/hehua07/clinical-assist-system
+
+包含 `clinical-assist-system` + `rag-repair-lessons` 两个 Skill。其他 Hermes 实例安装：
+```bash
+git clone git@github.com:hehua07/clinical-assist-system.git /tmp/skills
+cp -r /tmp/skills/clinical-assist-system ~/.hermes/skills/
+cp -r /tmp/skills/rag-repair-lessons ~/.hermes/skills/
+```
 ```
 用户浏览器 → https://www.hhysjt.com/clinical/
   → 阿里云 nginx (proxy_read_timeout=300s)
@@ -60,6 +79,12 @@ platforms: [linux, macos, windows]
 ```
 
 ## RAG服务操作
+
+### 一键健康检查（推荐）
+```bash
+/usr/bin/python3 ~/.hermes/skills/clinical-assist-system/scripts/health_check.py
+```
+检查 RAG/vLLM/Ollama 全部状态 + 自动运行一次分析测试（含计时）。
 
 ### 启动
 ```bash
@@ -96,6 +121,31 @@ nohup python3 -m vllm.entrypoints.openai.api_server \
   --enforce-eager \
   --enable-prefix-caching \
   > /tmp/vllm.log 2>&1 &
+```
+
+### ⚠️ 安全重启流程（加 prefix caching 等新参数时）
+
+**新参数可能触发 CUDA kernel 重新编译，编译期间禁止并发请求，否则系统卡死。**
+
+```bash
+# 1. 先切断外部流量
+pkill -9 rag_service
+
+# 2. 停旧 vLLM
+kill -15 $(pgrep -f vllm.entrypoints); sleep 5
+
+# 3. 启动新 vLLM
+nohup python3 -m vllm.entrypoints.openai.api_server \
+  --model ... --enable-prefix-caching ... &
+
+# 4. 等待完全就绪（编译可能需要几分钟）
+while ! curl -s http://127.0.0.1:8200/v1/models | grep -q '"object":"list"'; do
+  echo "等待 vLLM 就绪..."; sleep 10
+done
+echo "✅ vLLM 就绪"
+
+# 5. 恢复 RAG 服务
+cd /home/hehua/rag-service.bak && nohup /usr/bin/python3 rag_service.py > /tmp/rag_final.log 2>&1 &
 ```
 ⚠️ `--enable-prefix-caching` 可节省每次请求的 system prompt prefill (~10-15s)。但重启 vLLM 会使当前活跃请求中断，建议在维护窗口操作。
 
@@ -170,6 +220,12 @@ hermes sessions rename 20260718_081032_184e3a "修复医师辅助系统-中医Sk
 6. 如崩溃：`cp rag_service.py.bak.dip_logic rag_service.py`
 
 ## Changelog
+
+### 2026-07-18 (session 6 - Skill 分发 + 代理配置)
+- Skills 打包推送至 GitHub: https://github.com/hehua07/clinical-assist-system
+- 配置新加坡 tinyproxy 代理出海的完整流程（Allow 112.28.117.8）
+- Git 代理配置命令: `git config --global http.proxy http://47.236.149.135:8888`
+- 发现 Spark→GitHub SSH 直连可用，HTTPS/API 被墙
 
 ### 2026-07-18 (session 5 - 性能优化 p2)
 - 添加 [TIMER] 计时日志（Oracle查询/向量搜索/LLM推理）

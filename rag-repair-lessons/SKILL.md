@@ -1,7 +1,7 @@
 ---
 name: rag-repair-lessons
 description: "RAG临床辅助系统反复故障的根因分析与修复经验，包括max_tokens截断、timeout不一致、备份版本混乱、json解析鲁棒性等教训。任何智能体在处理RAG相关问题时，必须先加载本技能。"
-version: 1.1.0
+version: 1.2.0
 author: hehua
 platforms: [linux]
 ---
@@ -91,6 +91,17 @@ platforms: [linux]
 - **验证**: 看进程输出中的 [TIMER] 行。本系统：Oracle 0.1s + 向量 0.9s + LLM 97-150s（99%瓶颈）
 - **优化方向**: LLM慢则精简prompt/减少输出；向量慢则检查Ollama是否GPU模式
 
+### 8. LLM Prompt 精简：减少输出Token降低延迟
+- **症状**: LLM推理占99%耗时（10 tokens/s 生成1000+ tokens），输出过于verbose
+- **根因**: prompt要求过于详细，LLM生成大量可省略的嵌套结构和冗余描述
+- **修复 - 三步法**:
+  1. **扁平化合规分析**: drug/consumable/charge_compliance 从 `{risks:[],suggestions:[]}` deep-nested 改为简短 flat dict，字数从~400→~100
+  2. **精简指令条数**: 注意事项从15条压缩到8条核心规则，加"务必简洁"强调
+  3. **缩短特定字段**: progress_note 从100-200字 → 30-60字
+- **效果**: 输出从 ~3000字符 → ~1900字符，耗时从 ~130s → ~99s（提速 24%）
+- **常见陷阱**: 修改 prompt schema 前必须先检查前端 JS 对该字段的类型期望（object vs string），否则会破坏渲染。本系统中 `drug_compliance` 前端期望 `{risks:[],suggestions:[]}` 对象，不能改成纯字符串
+- **验证**: `grep TIMER` 看每次输出字符数和耗时
+
 ## RAG 启动故障排查流程
 
 ```bash
@@ -147,9 +158,32 @@ tail -3 ~/.hermes/logs/gateway.log
 4. **修改记录必须写到本技能的 Changelog**
 5. **如果连续 3 次重启失败，恢复备份并记录失败原因**
 
-## Changelog
+### 8. vLLM 重启添加编译参数时的并发风险 ⚠️
+- **症状**: 重启 vLLM 加新参数（如 `--enable-prefix-caching`）后系统卡住、无法响应
+- **根因**: vLLM 新参数可能触发 CUDA kernel 重新编译，编译期间如果有并发请求涌入会导致争抢卡死
+- **修复**: 重启 vLLM 前必须：
+  1. **先切断外部流量**（停 RAG 服务或关闭 frp 端口转发）
+  2. 等待 vLLM 完全启动（`curl http://127.0.0.1:8200/v1/models` 返回 200）
+  3. **再恢复流量**
+  ```bash
+  # 安全重启流程
+  systemctl stop rag-service  # 或 pkill rag_service
+  kill -15 $(pgrep -f vllm.entrypoints)
+  sleep 5
+  # 启动新 vLLM（等待编译完成）
+  nohup python3 -m vllm.entrypoints.openai.api_server \
+    --model ... --enable-prefix-caching ... &
+  # 等待就绪
+  while ! curl -s http://127.0.0.1:8200/v1/models | grep -q '"object":"list"'; do
+    echo "等待 vLLM 就绪..."; sleep 10
+  done
+  # 恢复 RAG 服务
+  systemctl start rag-service
+  ```
+- **验证**: 确认 vLLM 启动日志无 CUDA 编译错误，且单请求测试通过后，再开放外部访问
 
-### 2026-07-18 (p2)
+### 2026-07-18 (p3)
+- **新增**: 第8节 "LLM Prompt 精简法" — 三步法减少输出 token 降低延迟，含前端兼容性陷阱
 - **新增**: 日志混淆问题 — nohup vs Hermes bg 启动，stdout 走不同通道，tail 旧日志会误导
 - **新增**: TIMER 打点法 — 性能瓶颈定位（Oracle/向量/LLM 三段计时）
 - **新增**: prompt 精简技巧 — compliance_analysis 结构从 verbose nested → 简短 nested，指令从15条→8条
