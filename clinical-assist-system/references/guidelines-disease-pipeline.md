@@ -1,7 +1,9 @@
 # 病种驱动指南共识管线（disease_pipeline.py）
 
 需求4 产物（2026-07-20 session 23）。以结算 Top 病种为关键词自动建设指南/共识全文库：
-**AnySearch 发现 → 全文抓取 → guidelines.json → import_knowledge_base_v2 向量化 → rsync 上网站**。
+**AnySearch 发现 → 全文抓取 → guidelines.json → curate_guidelines.py 治理 → import_knowledge_base_v3 向量化 → rsync 展示页上网站**。
+
+⚠️ 2026-07-21 起，v2 导入已废弃。新增治理层 `curate_guidelines.py`（用户五条规则：近3年时效/同族新版优先(更新件除外)/同源择优/参考文献清洗/网页展示完整原文含参考文献），产出 `curated/guidelines_curated.json`+`clean/`+`display/`。v3 导入按块级全局去重，元数据带 year/local_url/kept_as。
 
 ## 文件清单
 
@@ -11,7 +13,9 @@
 | `pipeline_urls.json` | discover 产物：候选 URL 池（含 disease/title/type） |
 | `pipeline_state.json` | 断点状态：`done` 列表 + `failed` {url: 次数} |
 | `pipeline_full.log` | 运行日志 |
-| `content/guidelines.json` | 合并后的总索引（202 条） |
+| `content/guidelines.json` | 合并后的总索引（202 条，pub_date 字段是抓取年不可信，年份以标题解析为准） |
+| `curate_guidelines.py` | 治理脚本：家族分组(标准号/归一化标题/prefix合并)+时效+择优+清洗+展示页导出 |
+| `import_knowledge_base_v3.py` | 治理产物向量化（替代 v2） |
 | `content/*.md` | 全文 Markdown（文件名含 `**原文**` URL frontmatter） |
 
 ## 运行方式
@@ -21,8 +25,11 @@ cd /home/hehua/guidelines_scraper
 /usr/bin/python3 disease_pipeline.py --discover [--top N]   # 病种检索 → pipeline_urls.json
 /usr/bin/python3 disease_pipeline.py --fetch                # 断点续抓全文 → md + 合并 json
 /usr/bin/python3 disease_pipeline.py --all                  # 两步连跑
-/usr/bin/python3 import_knowledge_base_v2.py                # 向量化（删建式全量重建，~20min）
-systemctl --user restart rag-service.service                # 重建集合后必须重启
+/usr/bin/python3 curate_guidelines.py                     # 治理: curated/{clean,display,*.json}（只读原始库）
+systemctl --user stop rag-service.service                   # 停服避免集合句柄冲突
+/usr/bin/python3 import_knowledge_base_v3.py                # 向量化 guidelines（~10min，块级去重）
+systemctl --user start rag-service.service
+rsync -az --delete curated/display/ root@47.102.41.191:/var/www/hhysjt/guidelines/display/  # 展示页上站
 ```
 
 - `--fetch` 幂等断点续跑：`done` 跳过、`failed>=2` 跳过。

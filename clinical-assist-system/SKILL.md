@@ -729,6 +729,13 @@ CLINICAL_SESSION_HOURS=12
 - **操作**: 在 skill 中新增「指南/共识知识库」章节，记录数据源位置、API 端点、导入步骤、验证方法、前端集成清单
 - **ChromaDB 状态**: `guidelines=0`，`compliance=0` 已更新到状态表
 
+### 2026-07-21
+- 指南库按用户五条规则全面治理重建：138篇保留/206篇淘汰（3年时效·同族新版优先·同源择优·参考文献清洗）
+- 修复 scraper 错抓（2篇 zgsyz 文档正文是COVID文）、乱码标题、JSON截断标题、抓取日污染发布年
+- 向量库 2221→3192 块（块级全局去重跳过192块），检索改为按文档去重（n*3内部取数）
+- 展示页 /guidelines/display/*.html 公网上线（完整原文含参考文献+index目录页），前端指南卡加年份徽章/片段/📖全文链
+- rag-service commit 92ddb64 已推送；管线新顺序: pipeline fetch → curate → (停服)import v3(启服) → rsync display
+
 ### 2026-07-18 (session 9 - RAG进程异常500修复)
 - **RAG返回500 Internal Server Error**: health正常但分析接口返回纯文本500，前端JSON.parse失败
 - **根因**: RAG进程进入内部状态损坏（可能因之前LLM异常未正确处理），health跳过LLM所以正常
