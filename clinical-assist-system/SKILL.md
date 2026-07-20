@@ -1,7 +1,7 @@
 ---
 name: clinical-assist-system
 description: "寿县和华医院临床AI辅助系统（RAG + vLLM + DIP匹配）的调试记录、当前状态、已知问题和修复方案。任何智能体对系统进行修改后，必须更新此技能。"
-version: 1.11.0
+version: 1.13.0
 author: hehua
 platforms: [linux, macos, windows]
 ---
@@ -20,6 +20,7 @@ platforms: [linux, macos, windows]
 | 前端页面 | ✅ 全部正常（2026-07-20 session 19 再修复 /report/） | `https://www.hhysjt.com/clinical/`、`/guideline/search`、`/guidelines/`、`/report/` 公网全部 200，HTTP→HTTPS 301 正常。修复：SSH 直连（公钥已装）+ 本地构建 + scp 上传 hhysjt.conf（基于 bak4 + 收回悬空 location + 新增 /guideline 反代）→ nginx reload。**此后阿里云操作走 SSH 不再走 Workbench**，见 aliyun-nginx-proxy-location skill |
 | dip_operations | ✅ 正常 | 淮南分值库操作列表(20+条)，按分值降序 |
 | settlement_operations | ✅ 正常 | 结算参考数据(2-3条) |
+| 登录鉴权 | 🟡 代码落盘待重启（session 22） | HMAC签名会话Cookie+登录页；`/clinical*` `/patients/` `/query` `/counts` `/ingest_*` `/sync/` `/compliance/`(除query) 需登录，患者自查与指南库开放。账号在 .env `CLINICAL_USERS`（凭据不入库），设计见「医师端登录鉴权」节 |
 
 ### 性能数据（实测 2026-07-18）
 
@@ -517,6 +518,26 @@ auxiliary:
 hermes sessions rename 20260718_081032_184e3a "修复医师辅助系统-中医Skill融合"
 ```
 
+## 医师端登录鉴权（2026-07-20 session 22 实现 · 内网部署/患者数据保护需求）
+
+**架构**：rag_service.py 内 FastAPI 中间件 + HMAC-SHA256 签名会话 Cookie（零第三方依赖），HttpOnly + SameSite=Lax，HTTPS 请求自动加 Secure。会话默认 12h。同 IP 连续失败 5 次锁 5 分钟（内存计数，重启清零）。
+
+**保护范围**（`_auth_path_needs_login`，改路由前先核对此函数）：
+- 需登录：`/clinical*`（页面+assist+tcm+patients+doctors+departments+patient-summary）、`/patients/`、`/query`、`/counts`、`/ingest_*`、`/sync/`、`/compliance/`（除 `/compliance/query`）
+- 保持开放：`/health`、`/wechat*`、`/api/search-id6`、`/lab-results` `/reports` `/imaging-results` `/all-reports`（患者自查，身份证后6位设计）、`/guideline/*`、`/compliance/query`、`/login` `/logout`
+- ⚠️ **不做 localhost 豁免**：nginx 反代后所有请求的 client.host 都是 127.0.0.1，豁免=全放行
+- `CLINICAL_USERS` 为空时鉴权整体不启用（防把自己锁死）
+
+**配置（.env，凭据绝不写入技能库/git——本仓库会推 GitHub 公开仓）**：
+```
+CLINICAL_AUTH_ENABLED=1            # 0=临时关闭（仅调试）
+CLINICAL_USERS=账号1:密码1,账号2:密码2
+CLINICAL_SESSION_HOURS=12
+# CLINICAL_AUTH_SECRET 可选；缺省由账号表派生（改账号表=全部会话失效）
+```
+
+**行为**：未登录 GET /clinical → 302 到 /login；API → 401 JSON。前端 `authFetch()` 包装全部 11 处 fetch，401 自动跳登录页；页头有「⏻ 退出登录」(/logout 清 cookie)。登录页 `_LOGIN_PAGE` 内嵌在 rag_service.py。
+
 ## 修改规范（重要！）
 
 任何智能体修改必须：
@@ -532,17 +553,54 @@ hermes sessions rename 20260718_081032_184e3a "修复医师辅助系统-中医Sk
 - JS 里 `getElementById` 的元素 ID 先在 HTML grep 确认存在；引用的全局变量确认有顶层 `let/var` 声明
 - 交付时提醒用户 **Ctrl+F5 强刷**（浏览器缓存改造前旧页会表现为"改了没效果"）
 - "卡住/无反应"排查先分前后端：`journalctl --user -u rag-service.service --since "10 min ago" | grep -E "\[LLM\]|\[TIMER\]|POST"`——无新请求 = 前端没发出；有请求且全 200 = 后端无罪。详见 `references/frontend-analysis-paths.md`
-- **"文档记了 ≠ 修复落盘"（2026-07-20 真实踩坑）**：changelog/skill 声明"修复已生效"之前，必须 grep 目标文件确认补丁真实在盘；跨会话或上下文压缩恢复后，不信既有完成声明，先对盘验证——switchTab 修复曾被 session 19 文档"提前宣布完成"，HTML 实际未改，用户多踩一轮才发现
+- **"文档记了 ≠ 修复落盘"（2026-07-20 真实踩坑）**：changelog/skill 声明"修复已生效"之前，必须 grep 目标文件确认补丁真实在盘；跨会话或上下文压缩恢复后，不信既有完成声明，先对盘验证——switchTab 修复曾被 session 19 文档"提前宣布完成"，HTML 实际未改，用户多踩一轮才发现。**反向陷阱（session 22）**：裸关键词计数也会误判——`section-dip` grep 命中 2 处实为死函数里的 getElementById 引用而非元素定义（元素早删了），`mode:'quick'` 计数 0 是漏掉 `mode: 'quick'` 空格变体（补丁其实在）。核对落盘要用 `id="xxx"` 元素定义级模式 + 空白容差正则（`mode: *'quick'`），并区分"元素定义/函数定义/调用点"三种命中
 - 重启后**线上验证才算交付**：`curl -s https://www.hhysjt.com/clinical | grep -c "<新增代码标志串>"` 计数 ≥1 才可汇报（本地文件改了 ≠ 内存页更新 ≠ 公网可达）
 - 用户报"某按钮没用"三步审计：①grep 全部 `onclick="..."` 与对应 `function` 定义配对（死按钮检测）②curl 各按钮的后端接口看 HTTP 码+耗时 ③按上条 journalctl 分辨请求是否到达后端
-- **HTML 改动批量做、一次重启，重启前先打招呼**（2026-07-20 踩坑）：页面缓存于 `_CLINICAL_PAGE` 内存，任何 HTML 改动都要 `systemctl --user restart rag-service.service` 才生效；而 restart 命令需终端批准，用户常在微信端操作看不到 TUI 批准请求 → 超时阻断（当晚会话连续被拦两次，修复差点交付不出去）。规范：所有 HTML 补丁全部落盘 + readback 验证后，再发起唯一一次重启；重启前先微信告知"需在终端批准，或回复继续"
+- **HTML 改动批量做、一次重启，重启前先打招呼**（2026-07-20 踩坑）：页面缓存于 `_CLINICAL_PAGE` 内存，任何 HTML 改动都要 `systemctl --user restart rag-service.service` 才生效；而 restart 命令需终端批准，用户常在微信端操作看不到 TUI 批准请求 → 超时阻断（当晚会话连续被拦两次，修复差点交付不出去）。规范：所有 HTML 补丁全部落盘 + readback 验证后，再发起唯一一次重启；重启前先微信告知"需在终端批准，或回复继续"。**扩展到一切需批准的命令**（session 22 踩坑）：`.env` 写入、`py_compile`、curl POST 冒烟同样触发批准 gate 且 60s 无人点即拒——把它们与重启合并为最后一整条命令一次批准，分散发起会被逐个超时拒掉；被拒后不得换壳重试同一结果，只能等用户回来
 - **自动填充防覆盖模式**（prefillTCM 实例，2026-07-20）：代入患者数据的输入框，把上次自动填充值存 `window._xxxPrefilled`；再填前比对 `ta.value !== window._xxxPrefilled` → 医师手动改过就不覆盖（force 按钮除外）。代入内容**不含患者姓名**（具名信息不进在线 LLM 链路，脱敏正则不处理中文人名），只放性别/年龄/就诊类型/科室
 - **用户产品原则（2026-07-20 原话"把不能用的按钮取消，避免医师选错"）**：对医师暴露的 UI 宁缺毋滥——功能不确定能用就先隐藏/撤下，不留半成品按钮给医师误点。交付新按钮前必须自己先端到端点过一遍
 - **遮罩泄漏检查（2026-07-20 确诊）**：`grep -n "loadingIndicator" page.html`，每个 `classList.add('active')` 必须在成功/失败/异常全路径有配对 `remove`（finally 最保险；`.then().catch()` 两条链都要补）。漏 remove → 请求 200、结果已渲染，但全屏转圈永盖页面 = 用户报"卡住"。**日志全绿 + 页面停在转圈 = 遮罩泄漏，不是后端卡**
 - **静默守卫要配反馈**：函数顶部 `if (!x) return;` 命中时不转圈不报错 = "点击完全没反应"。加守卫顺手加 toast/error 提示
 - **术语对齐再动手**：用户说的「二次分析」= 更改主诊断/主操作后的重新分析（🔄 重新分析/选用按钮），不是结果页底部 🔍 detail 按钮。页面有多个相似入口时先让用户指认具体按钮再排查——词义没对齐，排查方向就错（首轮误判为浏览器缓存，白走一轮）
 
+## opencode 协同开发工作流（2026-07-20 确立，用户批准的分工模式）
+
+用户指定 opencode 承担本系统后期开发/维护的代码实现。分工红线：
+
+- **Hermes（编排+运维）**：需求→任务单→审查 diff→重启→公网验证→微信汇报。部署、nginx/frp、prompt 临床措辞、timeout/max_tokens、`.env` 永远不经 opencode。
+- **opencode（代码工）**：只做有界代码任务（页面功能、重构、补测试），在 `~/rag-service.bak` 内工作。
+
+执行流程：
+1. **开工前先同步仓库**：`git fetch origin && git rebase origin/main`——远端有 opencode GitHub Action 推的配置提交，不同步则 push 被拒（2026-07-20 实测：本地领先1落后4，落后的全是 Action 配置提交，无冲突）。
+2. **写任务单**：明确验收标准 + 红线（不许动 prompt/超时/部署配置）；大文件（clinical_assist_page.html 5000+ 行）圈定函数/行段范围，控制 token 消耗。
+3. **派发**：`opencode run '<任务单>'`（workdir=~/rag-service.bak；一次性任务不需要 pty，交互式才用 `background=true, pty=true`）。本机 opencode v1.18.3 已配 kimi/kimi-k3（装法见 api-key-setup 技能 `references/opencode-kimi.md`），全局配置已收紧权限：bash 默认 ask，只放行只读命令。
+4. **验收**：`git diff` 全量审查 + `py_compile`（Python）→ 按「修改规范」批量一次重启 → 公网 curl grep 标志串 ≥1 → 微信汇报。**opencode 的产出同样受上方「修改规范」全部条款约束**（改前备份、readback 落盘验证、遮罩泄漏检查、线上验证才算交付）。
+
 ## Changelog
+
+### 2026-07-20 (session 22 - 二次分析修复确认在线 + 登录鉴权实现)
+- **需求①二次分析超时**：确认 session 20b 补丁已随 13:02 重启上线（磁盘与线上页面一致）——reanalyzeWithSelection/reanalyzeWithCode 均 `mode: 'quick'`、遮罩 add/remove 双链配对、`id="section-dip"`/`id="section-dip-secondary"` 元素已删（残留的 renderDIP 死函数定义无害）
+- **需求②登录鉴权**：FastAPI 中间件 + HMAC 签名会话 Cookie（设计见「医师端登录鉴权」节）；前端 11 处 fetch 全部换 `authFetch`（401 自动跳登录）+ 页头退出按钮；登录页内嵌 rag_service.py
+- **状态**：代码全部落盘 + readback 验证 + py_compile 过，**.env 写入（CLINICAL_* 四行）与重启被 TUI 批准 gate 60s 超时挡住（用户暂时离开），待用户回来后一次重启 + 全链路验证**：①/login 200 ②未登录 /clinical→302、/clinical/patients→401 ③登录→Cookie→/clinical 200 ④/wechat 与 /api/search-id6 保持开放 ⑤quick 分析端到端计时 ⑥公网 https://www.hhysjt.com/clinical 跳登录
+- **⚠️ 凭据纪律**：初始账号 hehua 的密码只在 .env 和会话内告知用户，**绝不写入技能库**（本库会推 GitHub 公开仓）
+- 备份：rag_service.py.bak.20260720_181552 / clinical_assist_page.html.bak.20260720_181552 / .env.bak.20260720_181552
+
+### 2026-07-20 (session 22 - 医师端登录鉴权上线 + 二次分析超时闭环确认)
+- **需求①二次分析超时卡死 = 已闭环**：session 20b 的修复（遮罩泄漏 remove 配对 + 重分析改 quick 模式）确认 13:02 重启后已在线。本session端到端实测：`selected_operation=腹腔镜下胆囊切除术` quick 模式 **9.5s 返回 200**，主诊断+3条鉴别完整。磁盘核对：`id="section-dip"` 元素 0 个（renderDIP 仅剩无人调用的死函数）、3 处 `mode: 'quick'`、遮罩 add/remove 双链配对
+- **需求②登录鉴权 = 已上线（app 层，非 nginx auth_basic）**：
+  - **设计**：FastAPI 中间件 + HMAC-SHA256 签名会话 Cookie（`clinical_session`，HttpOnly，SameSite=Lax，12h）。选 app 层而非 nginx auth_basic 的原因：内网部署可能直连 :18790，nginx 层保护不到直连端口
+  - **保护路径**：`/clinical*`（页面+assist+tcm+patients+doctors+departments+patient-summary）、`/patients/*`、`/query`、`/counts`、`/ingest_*`、`/sync/*`、`/compliance/{visit_id}`。未登录：页面 302→/login，API 401 JSON
+  - **保持开放**：`/health`、`/wechat*`、`/api/search-id6`、`/lab-results`、`/reports`、`/imaging-results`、`/all-reports`、`/guideline/*`、`/compliance/query`（患者自查+指南知识库不受影响）
+  - **账号配置**在 `.env`：`CLINICAL_AUTH_ENABLED=1`、`CLINICAL_USERS=账号1:密码1,账号2:密码2`（多账号逗号分隔）、`CLINICAL_SESSION_HOURS=12`。当前账号 `hehua`（初始密码用户已知，可自行改 .env）。未配 CLINICAL_AUTH_SECRET 时由账号表派生 secret（改账号表=全部会话失效）
+  - **防爆破**：同 IP 连续失败 5 次锁 5 分钟（内存计数，重启清零）
+  - **前端**：`authFetch()` 包装全部 11 处 fetch，401 统一跳 /login；头部加「⏻ 退出登录」按钮 → /logout 删 cookie
+  - **nginx 配套**：阿里云 hhysjt.conf 新增 `location = /login` 和 `location = /logout` 反代 18790（110 行处 sed 插入，`nginx -s reload` 生效，worker 18:52 更新）——⚠️教训：新增 RAG 端点若要走公网，必须同步检查 nginx location 清单，本次公网 404 就是因为只加了后端路由
+  - **验证**：本机 7 项 + 公网 7 项全过（登录页200/未登录302/API401/错密码401/登录发cookie/带cookie 200/患者入口开放）；git commit `8c8ff55` 已推 main（rebase 掉 opencode Action 4 个配置提交，分叉清零）
+
+### 2026-07-20 (session 21 - opencode 装机 + 协同开发工作流确立)
+- **用户决策**：opencode 承担本系统后期开发维护的代码实现，Hermes 负责编排/审查/部署/验证（分工见新增「opencode 协同开发工作流」章节）
+- **装机**：opencode v1.18.3（npm 全局，npmmirror 源）；provider = kimi/kimi-k3 走 api.moonshot.cn/v1（复用 Hermes 的 KIMI_CN_API_KEY），config `~/.config/opencode/opencode.json` + auth `~/.local/share/opencode/auth.json`；冒烟测试 OPENCODE_SMOKE_OK 通过
+- **仓库待办**：本地领先1落后4（远端 4 个均为 opencode GitHub Action 配置提交），首次开工前需 fetch+rebase
 
 ### 2026-07-20 (session 20b - 重新分析卡住真凶=遮罩泄漏 + 去DIP + 重分析提速)
 - **真凶确诊**: 用户纠正「二次分析」= 更改主诊断/主操作后的重新分析。`reanalyzeWithCode()`（操作候选「选用」按钮触发）只 `loading.classList.add('active')` 永不 remove → 请求 200 返回、结果已渲染，全屏转圈遮罩永盖页面。修复：`.then`/`.catch` 双链补 remove
