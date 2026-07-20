@@ -1,7 +1,7 @@
 ---
 name: clinical-assist-system
 description: "寿县和华医院临床AI辅助系统（RAG + vLLM + DIP匹配）的调试记录、当前状态、已知问题和修复方案。任何智能体对系统进行修改后，必须更新此技能。"
-version: 1.13.0
+version: 1.14.0
 author: hehua
 platforms: [linux, macos, windows]
 ---
@@ -15,12 +15,14 @@ platforms: [linux, macos, windows]
 | vLLM | ✅ 运行 | Qwen3-32B-NVFP4, :8200, max-model-len=16384, **prefix caching 已启用** |
 | RAG服务 | ✅ 运行 | :18790, systemd用户服务(开机自启), 路径 /home/hehua/rag-service.bak/ |
 | Ollama | ✅ 运行 | :11434, qwen3-embedding (v0.32.1, **GPU模式**) |
-| ChromaDB | ✅ 运行 | dip_rules=4481, settlement_2025=4704, guidelines=83, compliance=0（空）, **tcm_knowledge=3438（倪海厦，session 18 导入）** |
+| ChromaDB | ✅ 运行 | dip_rules=4481, settlement_2025=4704, **guidelines=2221（133篇全文，session 23 病种管线重建，检索实测命中新指南）**, compliance=4, tcm_knowledge=3438 |
 | LLM引擎 | 🌐 DeepSeek在线（主） | `RAG_LLM_PROVIDER=online`（.env），DeepSeek→GLM→本地vLLM自动降级 + 调用前脱敏；回切本地改 .env 一行重启。实测 quick 6s/detail 7s |
 | 前端页面 | ✅ 全部正常（2026-07-20 session 19 再修复 /report/） | `https://www.hhysjt.com/clinical/`、`/guideline/search`、`/guidelines/`、`/report/` 公网全部 200，HTTP→HTTPS 301 正常。修复：SSH 直连（公钥已装）+ 本地构建 + scp 上传 hhysjt.conf（基于 bak4 + 收回悬空 location + 新增 /guideline 反代）→ nginx reload。**此后阿里云操作走 SSH 不再走 Workbench**，见 aliyun-nginx-proxy-location skill |
 | dip_operations | ✅ 正常 | 淮南分值库操作列表(20+条)，按分值降序 |
 | settlement_operations | ✅ 正常 | 结算参考数据(2-3条) |
-| 登录鉴权 | 🟡 代码落盘待重启（session 22） | HMAC签名会话Cookie+登录页；`/clinical*` `/patients/` `/query` `/counts` `/ingest_*` `/sync/` `/compliance/`(除query) 需登录，患者自查与指南库开放。账号在 .env `CLINICAL_USERS`（凭据不入库），设计见「医师端登录鉴权」节 |
+| 登录鉴权 | ✅ 已上线（session 22） | HMAC签名会话Cookie+登录页；`/clinical*` `/patients/` `/query` `/counts` `/ingest_*` `/sync/` `/compliance/`(除query) 需登录，患者自查与指南库开放。账号在 .env `CLINICAL_USERS`（凭据不入库），设计见「医师端登录鉴权」节 |
+| 语音输入 | ✅ 已上线（session 23） | 浏览器 MediaRecorder → `POST /clinical/transcribe` → SenseVoice Small int8（sherpa-onnx，纯 CPU，加载 0.6s，5.6s 音频 0.09s 出结果）。模型在 `~/rag-service.bak/models/sense-voice/`（237MB，已入 .gitignore 勿提交）。弃用 Web Speech API 的原因：国内浏览器不可用 |
+| 网站巡检 | ✅ 已上线（session 23） | cron `739bd07f80b9` 每5分钟跑 `~/.hermes/scripts/hhysjt_watchdog.py`（9项：RAG/vLLM/Ollama/frp/公网四端点/磁盘），全绿静默、异常/恢复推微信（deliver=all，no_agent） |
 
 ### 性能数据（实测 2026-07-18）
 
@@ -124,7 +126,7 @@ journalctl --since "today" | grep "Scheduled restart" | head -10
 
 | 文档 | 路径 | 说明 |
 |:--|:--|:--|
-| Prefix Caching 分析 | `references/prefix-caching-analysis.md` | vLLM prefix caching 利弊、操作、替代方案 |\n| 中医融合方案 | `references/tcm-nihaixia-fusion-plan.md` | nihaixia 中医 Skill 融合到临床系统 |\n| 中医测试报告 | `references/tcm-nihaixia-test-results.md` | 4项效果测试 + 融合建议 |\n| nginx + frp 调试 | `references/nginx-proxy-frp-debug.md` | nginx proxy_pass 写入方式、\$转义陷阱、盲打调试技巧 |
+| Prefix Caching 分析 | `references/prefix-caching-analysis.md` | vLLM prefix caching 利弊、操作、替代方案 |\n| 中医融合方案 | `references/tcm-nihaixia-fusion-plan.md` | nihaixia 中医 Skill 融合到临床系统 |\n| 中医测试报告 | `references/tcm-nihaixia-test-results.md` | 4项效果测试 + 融合建议 |\n| nginx + frp 调试 | `references/nginx-proxy-frp-debug.md` | nginx proxy_pass 写入方式、\$转义陷阱、盲打调试技巧 |\\n| 病种指南管线 | `references/guidelines-disease-pipeline.md` | 需求4 管线用法/状态文件/坑（涓流下载/孤儿补登/重试上限）+ ASR 验证法 |
 
 ### 2. 讯飞Spark API Key 授权失效
 - **报错**: `AppIdNoAuthError (code=11200)`
@@ -374,16 +376,28 @@ nohup /usr/bin/python3 -m vllm.entrypoints.openai.api_server \
 
 ## 指南/共识知识库（guidelines + compliance）
 
-系统内置了两个面向指南共识和医保合规的向量集合，已导入 84 篇指南（83 chunks）到 `guidelines` 集合，`compliance` 集合为空（待导入合规文档）。
+系统内置了两个面向指南共识和医保合规的向量集合。2026-07-20（session 23）病种管线重建后：`guidelines` = **133 篇全文 / 2221 chunks**（此前仅 83 条摘要级 chunks），`compliance` = 4 篇。
 
 ### 数据源概览
 
 | 数据 | 路径 | 数量 |
 |:--|:--|:--:|
-| 指南共识全文 Markdown | `/home/hehua/guidelines_scraper/content/*.md` | **106+ 篇** |
-| 结构化 JSON 索引 | `/home/hehua/guidelines_scraper/content/guidelines.json` | **84 条**（含标题/出版商/期刊/URL/摘要） |
-| 导入脚本 | `/home/hehua/guidelines_scraper/import_knowledge_base.py` | ✅ 将 markdown 分块后注入 ChromaDB |
-| 合规文档 | `/home/hehua/guidelines_scraper/compliance/` | 少量（医保局/药监局法规） |
+| 指南共识全文 Markdown | `/home/hehua/guidelines_scraper/content/*.md` | **340+ 个**（含 v2_ 前缀的网站导出副本） |
+| 结构化 JSON 索引 | `/home/hehua/guidelines_scraper/content/guidelines.json` | **202 条**（标题/出版商/期刊/URL/摘要/关联病种） |
+| 病种驱动管线 | `/home/hehua/guidelines_scraper/disease_pipeline.py` | ✅ session 23 新建，见下节 |
+| 向量化导入 | `/home/hehua/guidelines_scraper/import_knowledge_base_v2.py` | ✅ 删建式全量重建（幂等），800字分块重叠100 |
+| 合规文档 | `/home/hehua/guidelines_scraper/compliance/` | 4 篇 |
+
+### 病种驱动指南管线（需求4，session 23 建成）
+
+结算 Top34 病种 × AnySearch 检索 → 全文抓取（PDF→PyMuPDF／HTML→正文抽取／医脉通详情接口）→ 合并 guidelines.json → `import_knowledge_base_v2.py` 向量化 → rsync 同步阿里云 `/var/www/hhysjt/guidelines/`。**用法、状态文件、坑（境外站涓流下载挂死 / merge-at-end 断点孤儿 / 失败重试风暴）与对账补登方法见 `references/guidelines-disease-pipeline.md`**。日常增量：
+
+```bash
+cd /home/hehua/guidelines_scraper
+/usr/bin/python3 disease_pipeline.py --discover        # 只发现 → pipeline_urls.json
+/usr/bin/python3 disease_pipeline.py --fetch           # 断点续抓（state 自动跳过已完成/二连失败）
+/usr/bin/python3 import_knowledge_base_v2.py           # 全量重建向量后必须重启 rag-service
+```
 
 ### RAG 服务已实现的 API 端点
 
@@ -561,6 +575,7 @@ CLINICAL_SESSION_HOURS=12
 - **用户产品原则（2026-07-20 原话"把不能用的按钮取消，避免医师选错"）**：对医师暴露的 UI 宁缺毋滥——功能不确定能用就先隐藏/撤下，不留半成品按钮给医师误点。交付新按钮前必须自己先端到端点过一遍
 - **遮罩泄漏检查（2026-07-20 确诊）**：`grep -n "loadingIndicator" page.html`，每个 `classList.add('active')` 必须在成功/失败/异常全路径有配对 `remove`（finally 最保险；`.then().catch()` 两条链都要补）。漏 remove → 请求 200、结果已渲染，但全屏转圈永盖页面 = 用户报"卡住"。**日志全绿 + 页面停在转圈 = 遮罩泄漏，不是后端卡**
 - **静默守卫要配反馈**：函数顶部 `if (!x) return;` 命中时不转圈不报错 = "点击完全没反应"。加守卫顺手加 toast/error 提示
+- **服务依赖必须用服务自己的解释器安装**（2026-07-20 session 23 踩坑，bs4/sherpa-onnx 连踩两次）：Hermes 终端 PATH 里的 `pip3`/`python3` 指向 **hermes-venv**，而 rag-service 的 systemd `ExecStart` 是 `/usr/bin/python3`——裸 `pip3 install` 把包装进 venv，服务依旧 ImportError 且不易察觉。一律 `/usr/bin/python3 -m pip install --break-system-packages <pkg>`，并用同一解释器 `import` 验证。通则：给哪个进程装依赖，就用哪个进程的解释器装+验
 - **术语对齐再动手**：用户说的「二次分析」= 更改主诊断/主操作后的重新分析（🔄 重新分析/选用按钮），不是结果页底部 🔍 detail 按钮。页面有多个相似入口时先让用户指认具体按钮再排查——词义没对齐，排查方向就错（首轮误判为浏览器缓存，白走一轮）
 
 ## opencode 协同开发工作流（2026-07-20 确立，用户批准的分工模式）
@@ -577,6 +592,17 @@ CLINICAL_SESSION_HOURS=12
 4. **验收**：`git diff` 全量审查 + `py_compile`（Python）→ 按「修改规范」批量一次重启 → 公网 curl grep 标志串 ≥1 → 微信汇报。**opencode 的产出同样受上方「修改规范」全部条款约束**（改前备份、readback 落盘验证、遮罩泄漏检查、线上验证才算交付）。
 
 ## Changelog
+
+### 2026-07-20 (session 23 - 需求3四件套上线 + 病种指南管线 + 网站巡检看门狗)
+- **需求3 全部上线（commit `071c5bc` 已推 main；本机+公网实测通过）**：
+  - 3a 首次病程记录：`CLINICAL_SYSTEM_PROMPT_QUICK` 新增 `first_course_record`（病例特点/诊断依据/鉴别诊断/诊疗计划），quick max_tokens 1600→2600；前端 `section-fcr` 渲染区 + 一键复制
+  - 3b 鉴别诊断丰富化：4-6 条、支持点/不符点/排除方法结构化、按可能性排序（实测 6 条，排除法具体到 CT/MRCP/淀粉酶/立位平片）
+  - 3c DIP 入组优化：注入排序键 `std_dip_value`（**数据中不存在的键，排序恒无效**）→ 改按 `relevance`；提示语改"微创/患者负担轻优先、不唯分值"；结算数据注入定位改"参考本院操作习惯"。实测推荐理由已带微创表述
+  - 3d 语音输入：MediaRecorder + `POST /clinical/transcribe` + SenseVoice Small int8（sherpa-onnx，CPU）。模型仓库 `csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-**2025-09-09**`（2024-07-17 int8 不存在，hf-mirror 可下）。**验证 ASR 用模型仓库官方 `test_wavs/zh.wav`，别用 Edge TTS 现生成样本**——限流截断的 2.1s 坏音频让模型幻觉输出 "SIX FIVE THREE"，一度误判 ASR 坏
+- **需求4 病种指南管线**：`/home/hehua/guidelines_scraper/disease_pipeline.py`（34 病种 × AnySearch → 195 URL → 全文 202 条入 guidelines.json → 133 篇向量化 2221 chunks）。坑与修法详见 `references/guidelines-disease-pipeline.md`：境外站涓流下载挂死 → 90s 硬时限+30MB 上限流式读；merge 在 fetch 末尾 + 进程被 kill → 141 条已抓取未登记的孤儿 → 按 md frontmatter 的 `**原文**` URL 对账补登；失败 URL 无限重试 → failed_map 计次上限 2
+- **需求5 网站巡检**：`~/.hermes/scripts/hhysjt_watchdog.py`（9 项：RAG/vLLM/Ollama/frpc/公网四端点/磁盘水位），cron job `739bd07f80b9` 每 5 分钟 no_agent 运行；**状态文件比对只在 故障/恢复 跃迁时输出**（全绿静默）→ `deliver='all'` 推微信。告警+恢复链路均实测
+- **✅ 复核闭环（session 23 续）**：`/health` 顶层平铺键确认 `guidelines: 2221` 在线（此前"没解析到"是把响应当嵌套 `collections` 键解析的错）；`/guideline/search` 响应格式是 `{answer, sources}`（非 results）——三病种实测全部命中当日新指南（胆石症共识2025/急性缺血性卒中指南2023/肛瘘共识2020）；rsync 同步阿里云 204 个新文件，公网单文件 200（218KB 全文可下载）
+- 备份：`rag_service.py` / `clinical_assist_page.html` → `.bak.20260720_195424`
 
 ### 2026-07-20 (session 22 - 二次分析修复确认在线 + 登录鉴权实现)
 - **需求①二次分析超时**：确认 session 20b 补丁已随 13:02 重启上线（磁盘与线上页面一致）——reanalyzeWithSelection/reanalyzeWithCode 均 `mode: 'quick'`、遮罩 add/remove 双链配对、`id="section-dip"`/`id="section-dip-secondary"` 元素已删（残留的 renderDIP 死函数定义无害）
