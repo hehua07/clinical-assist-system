@@ -1,7 +1,7 @@
 ---
 name: rag-repair-lessons
 description: "RAG临床辅助系统反复故障的根因分析与修复经验，包括max_tokens截断、timeout不一致、备份版本混乱、json解析鲁棒性等教训。任何智能体在处理RAG相关问题时，必须先加载本技能。"
-version: 1.2.0
+version: 1.4.0
 author: hehua
 platforms: [linux]
 ---
@@ -12,9 +12,87 @@ platforms: [linux]
 
 1. **改代码前先备份** — 每次修改前 `cp rag_service.py rag_service.py.bak.$(date +%Y%m%d_%H%M%S)`
 2. **只改一个变量，验证一个** — 不要一次性改多个参数，否则不知道哪个修好了问题
-3. **日志是上帝** — `tail -f /tmp/rag_final*.log` 实时看，不要猜
+3. **日志是上帝** — `journalctl --user -u rag-service.service -n 50 -f --no-pager` 实时看，不要猜
 
 ## 已知故障根因
+
+### 15. nginx 配置路径因 OS 类型不同（CentOS conf.d/ vs Ubuntu sites-enabled/）⚠️
+
+- **症状**: 所有对 `/etc/nginx/sites-enabled/default` 的修改（sed、Python、heredoc）看似执行成功，但 `/guideline/search` 仍返回 nginx 404，而 `/clinical` 偶尔生效。从 curl 检查认为 nginx 配置改了但行为不一致
+- **根因**: 阿里云服务器是 **CentOS**，nginx server 配置在 `/etc/nginx/conf.d/hhysjt.conf`，**不是** Ubuntu/Debian 的 `/etc/nginx/sites-enabled/default`。Ubuntu 的 `sites-enabled/` 目录通过 `../sites-available/default` 符号链接被 nginx 的主配置 `nginx.conf` include，但 CentOS 用 `conf.d/` 目录
+- **排查方法**:
+  ```bash
+  # 1. 先确认 OS 类型（不是 Ubuntu 就不要用 sites-enabled/）
+  cat /etc/os-release | head -3
+
+  # 2. 找 nginx 的 server 块配置
+  grep -rn "server_name.*www\|proxy_pass" /etc/nginx/conf.d/ 2>/dev/null
+  grep -rn "server_name.*www\|proxy_pass" /etc/nginx/sites-enabled/ 2>/dev/null
+
+  # 3. 查看全部 include 路径
+  grep "include" /etc/nginx/nginx.conf | grep -v "^[[:space:]]*#"
+
+  # 4. 确认 nginx -t 实际检查哪些文件
+  nginx -T 2>&1 | grep -E "server_name|location /" | head -20
+  # nginx -T 会 dump 全部生效的配置，排除路径猜测
+  ```
+- **修复**: 找到正确的 server 配置后直接编辑，然后 `nginx -t && nginx -s reload`
+- **关键教训**: 远程调试 nginx 时，第一步不是写配置，而是确认：
+  1. OS 类型（CentOS `conf.d/` vs Ubuntu `sites-enabled/`）
+  2. nginx 主配置的 include 路径（`grep include /etc/nginx/nginx.conf`）
+  3. nginx -T dump 全部生效配置确认当前状态
+  4. 如果可能，用 `nginx -T 2>&1 | grep "location /guideline"` 验证修改是否实际生效
+- **相关**: certbot 报错也会揭示配置路径（如 `Problem in /etc/nginx/conf.d/hhysjt.conf`）
+
+### 16. 用户报"卡住/点击无反应"，后端日志全绿 → 问题在前端，别改后端 ⚠️
+
+- **症状**: 用户报某按钮"卡住"或"点击没反应"，但服务健康、curl 后端接口全部正常
+- **诊断（30 秒定前后端）**:
+  ```bash
+  journalctl --user -u rag-service.service --since "10 min ago" --no-pager | grep -E "\[LLM\]|\[TIMER\]|POST /clinical"
+  ```
+  对照用户点击时间，三种结果三条路：
+  1. **无任何新请求记录** → 前端 JS 根本没发出 fetch。查：dispatcher 函数缺分支、`getElementById` 的元素 ID 不存在（try 块外抛异常会留下"按钮永远转圈"的假象）、全局变量未声明
+  2. **有请求且全部 200 返回** → 后端无罪。嫌疑：浏览器缓存改造前旧页（让用户 **Ctrl+F5** 强刷）、生成耗时偏长（10s+）被感知为"卡住"、nginx/frp 中间层超时截断、**前端遮罩泄漏**（见下）
+  3. **有请求无 200 返回** → 才是真·后端卡住，按第 7 节 TIMER 打点定位阶段
+- **2026-07-20 病例**: 用户报"中医辨证点击无反应"。journal 全程无 `/clinical/tcm` 请求 → 前端未发出。根因：新增 Tab 时只加了按钮和内容 div，**漏在 `switchTab()` dispatcher 里加分支**——点击后所有 tab 被取消激活、所有内容被隐藏，无匹配分支 → 页面空白。修复 = 补 3 行 `else if (tab === 'tcm')` 分支
+- **2026-07-20 病例2（遮罩泄漏）**: 用户报"更改主操作后二次分析卡住"。journal 全 200（~11s 返回）→ 属分支2。真凶：`reanalyzeWithCode()`（「选用」按钮）只 `loading.classList.add('active')`，`.then`/`.catch` 都没 remove——结果已渲染，全屏转圈遮罩永盖页面。**日志全绿 + 页面停在转圈 = 遮罩泄漏**。排查法：`grep -n "loadingIndicator" page.html` 逐点核对 add/remove 全路径配对。连带教训：用户说的「二次分析」指"改诊断/操作后重新分析"，不是 detail 按钮——**词义没对齐就动手排查，方向必错**
+- **关键教训**:
+  - **新增 UI 元素接入既有 dispatcher（tab 切换、路由、状态机）时，按钮+内容+分支三触点缺一不可**；改完 grep 核对每个 onclick 参数在函数体内有对应分支
+  - 前端 HTML 改动**必须重启 rag-service 才生效**——`/clinical` 页面在服务启动时一次性读入 `_CLINICAL_PAGE` 内存变量，改文件不重启 = 没改
+  - 交付前端修复时主动让用户 Ctrl+F5，否则浏览器旧缓存会让你误以为"修复无效"而乱改
+  - 与第 13 节互为镜像：13 是"后端坏了前端报错"，本节是"后端好好的前端坏了"——两者共同原则都是**先拿日志/curl 证据分清前后端，再动手**
+
+### 14. 系统冻结诊断：systemd 重启循环 + GPU 压力导致桌面无响应
+
+- **症状**: GNOME/桌面键盘和鼠标完全无响应，只能硬重启。重启后键盘仍然无响应或服务大量失败
+- **根因**: systemd 系统服务（`/etc/systemd/system/`）指向不存在的文件，`Restart=always`（每5秒fork）+ `Restart=on-failure`（每15秒fork），持续产生 zombie 进程。同时 vLLM 加载 Qwen3-32B（19GB）吃满 GPU，systemd 资源竞争 + GPU 压力叠加，导致 GNOME 输入线程饿死，桌面完全冻结
+- **排查流程**:
+  ```bash
+  # 1. 检查是否有服务在无限重启
+  systemctl list-units --state=failed --no-pager
+  systemctl list-units --state=activating --no-pager
+  journalctl --since "today" | grep "Scheduled restart" | head -10
+
+  # 2. 检查内核 NMI 日志（冻结时的关键信号）
+  journalctl -k | grep -i "nmi\|NMI\|lockup\|watchdog"
+  # 典型输出: "NMI backtrace for cpu N ... VLLM::EngineCor"
+
+  # 3. 批量停掉并禁用坏服务
+  sudo systemctl stop hermes-rag.service rag-service.service
+  sudo systemctl disable hermes-rag.service rag-service.service
+
+  # 4. 确认 RAG 真实服务是否正常
+  systemctl --user status rag-service.service
+  curl -s http://127.0.0.1:18790/health
+
+  # 5. 验证 vLLM 正常
+  curl -s http://127.0.0.1:8200/v1/models
+  ```
+
+- **关键信号**: health 检查正常 + 桌面冻结 = 不是代码问题，是 systemd + GPU 资源竞争。不要改 RAG 代码
+- **预防**: 每次修改 systemd 服务文件后，用 `systemctl daemon-reload` 并检查 `systemctl list-units --state=failed`
+- **⚠️ 两种 systemd 层级**: 系统级（`/etc/systemd/system/`）失效不会影响用户级（`~/.config/systemd/user/`）的服务。RAG 正常工作用的是用户级服务
 
 ### 1. max_tokens 截断导致 JSON 解析失败（最高频！）
 - **症状**: `LLM输出解析失败`，`raw_response` 末尾明显不完整
@@ -63,18 +141,23 @@ platforms: [linux]
   result = json.loads(clean2, strict=False)
   ```
 
-### 6. 日志混淆：旧进程日志 vs 新进程输出
-- **症状**: 修代码后重启RAG，但tail日志看到的启动信息（如LLM_MODEL）与当前代码不一致
-- **根因**: RAG 有 2 种启动方式，stdout 走不同的通道：
-  - `nohup ... > /tmp/rag_final.log` — stdout 写文件。只有 nohup 启动的进程会写，文件内容持久
-  - Hermes `terminal(background=true)` — stdout 走内部 pipe（`/proc/<pid>/fd/1 -> pipe`），不写文件
-  - 重启后旧 nohup 进程的日志仍残留，tail 看到的是错误内容
-- **诊断**: 
-  ```bash
-  ls -la /proc/$(pgrep -f rag_service | head -1)/fd/1
-  # pipe → Hermes bg 启动; 文件 → nohup 启动; socket → 其他
+### 5b. Python `\b` 在 CJK 边界失效（脱敏正则踩坑）⚠️
+- **症状**: `re.sub(r"\b\d{17}[\dXx]\b", ...)` 对 `身份证340102198005156321` 不匹配
+- **根因**: Python3 re 中 CJK 字符（如"证"）与数字同属 word 字符，汉字与数字之间**没有** `\b` 边界
+- **修复**: 用纯数字 lookaround 代替 `\b`
+  ```python
+  _ID18_RE = re.compile(r"(?<!\d)\d{17}[\dXx](?!\d)")
+  _PHONE_RE = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
   ```
-- **修复**: 用 Hermes 的 `process(action='log', session_id=...)` 看正确的进程输出
+- **验证要点**: 同时回归"不误伤"场景——DIP编码 `K35.8_47.0901_01_00`、11位住院号 `20250615001` 不得被手机号规则误删
+
+### 5c. ChromaDB 批量 upsert：批内重复 ID 整批失败
+- **症状**: `Expected IDs to be unique, found duplicates of: tcm_xxx in upsert`，整个 50 条批次报错
+- **根因**: 导入脚本 ID = sha1(文件|章节标题|序号)，同名章节（如多文件共有的病例标题）产生同 ID 块；ChromaDB upsert 要求**批内** ID 唯一
+- **修复**: import_tcm.py 已带"批失败→逐条 upsert→跳过重复"回退；重复块是同内容重块，**去重即预期行为**（3595 块扫描 → 3438 条入库）
+- **注意**: 不要把"重复 ID 警告"当故障反复重跑——重跑幂等，只会再跳过同样一批，浪费时间
+
+### 6. 日志混淆：旧进程日志 vs 新进程输出 — **2026-07-19 迁移到 systemd 后已更新**\n- **（旧）症状**: 修代码后重启RAG，但tail日志看到的启动信息（如LLM_MODEL）与当前代码不一致\n- **（旧）根因**: RAG 有 2 种启动方式，stdout 走不同的通道：\n  - `nohup ... > /tmp/rag_final.log` — stdout 写文件。只有 nohup 启动的进程会写，文件内容持久\n  - Hermes `terminal(background=true)` — stdout 走内部 pipe（`/proc/<pid>/fd/1 -> pipe`），不写文件\n  - 重启后旧 nohup 进程的日志仍残留，tail 看到的是错误内容\n- **⚠️ 当前情况（2026-07-19起）**: RAG 已迁移到 systemd 用户服务，日志通过 journald 管理。不再使用 nohup 或 Hermes background 启动\n- **当前日志查看**: `journalctl --user -u rag-service.service -n 50 -f --no-pager`\n- **仍然有效的诊断方法**: `ls -la /proc/$(pgrep -f rag_service | head -1)/fd/1` 可判断 stdout 方向
 
 ### 7. 性能瓶颈定位：TIMER 打点法
 - **症状**: 分析慢（100s+）但不知道哪个阶段慢
@@ -105,25 +188,28 @@ platforms: [linux]
 ## RAG 启动故障排查流程
 
 ```bash
-# 1. 先检查端口是否被占用
+# 1. 先检查 systemd 服务状态
+systemctl --user status rag-service.service
+
+# 2. 检查日志（取代旧的 tail /tmp/rag_final*.log）
+journalctl --user -u rag-service.service -n 50 --no-pager
+
+# 3. 如果服务挂了，查原因
+journalctl --user -u rag-service.service -n 100 --no-pager | grep -iE "error|traceback|exception"
+
+# 4. 检查端口是否被占用
 ss -tlnp | grep 18790
 
-# 2. 检查日志最新内容
-tail -10 /tmp/rag_final*.log
-
-# 3. 检查是否有旧进程残留
-ps aux | grep rag_service | grep -v grep
-
-# 4. 如果 health 返回 0 数据，查 CHROMA_PATH
+# 5. 如果 health 返回 0 数据，查 CHROMA_PATH
 grep CHROMA_PATH /home/hehua/rag-service.bak/rag_service.py
 
-# 5. 如果 LLM 解析失败，查 raw_response 长度
+# 6. 如果 LLM 解析失败，查 raw_response 长度
 grep 'max_tokens' /home/hehua/rag-service.bak/rag_service.py
 
-# 6. 如果超时，查 timeout 值
+# 7. 如果超时，查 timeout 值
 grep 'timeout=' /home/hehua/rag-service.bak/rag_service.py | grep -v 'def'
 
-# 7. 如果 dip_operations 消失，查备份版本
+# 8. 如果 dip_operations 消失，查备份版本
 grep 'dip_operations' /home/hehua/rag-service.bak/rag_service.py
 ```
 
@@ -150,15 +236,18 @@ tail -3 ~/.hermes/logs/gateway.log
    ```bash
    python3 -c "import py_compile; py_compile.compile('rag_service.py', doraise=True); print('OK')"
    ```
-3. **重启 RAG 后必须测试**：
+3. **重启 RAG 后必须测试**：不要固定 `sleep 35`——轮询到就绪再测（就绪快则 3s，慢时不误判）；冒烟测试用 `mode=quick`（在线 provider ~6s 出结果，比 full 模式快一个量级）
    ```bash
-   sleep 35
-   python3 -c "import urllib.request, json; r=json.loads(urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:18790/clinical/assist', data=b'{\"patient_name\":\"蔡维良\"}', headers={'Content-Type':'application/json'}), timeout=300).read()); a=r['analysis']; print('OK' if 'primary_diagnosis' in a else 'FAIL: '+a.get('error','?'))"
+   systemctl --user restart rag-service.service
+   for i in $(seq 1 20); do sleep 3
+     curl -s -m 5 http://127.0.0.1:18790/health | grep -q '"status":"ok"' && { echo "✅ 就绪 ($((i*3))s)"; break; }
+   done
+   python3 -c "import urllib.request, json; r=json.loads(urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:18790/clinical/assist', data=b'{\"patient_name\":\"蔡维良\",\"mode\":\"quick\"}', headers={'Content-Type':'application/json'}), timeout=300).read()); a=r['analysis']; print('OK' if 'primary_diagnosis' in a else 'FAIL: '+a.get('error','?'))"
    ```
 4. **修改记录必须写到本技能的 Changelog**
 5. **如果连续 3 次重启失败，恢复备份并记录失败原因**
 
-### 8. vLLM 重启添加编译参数时的并发风险 ⚠️
+### 10. vLLM 重启添加编译参数时的并发风险 ⚠️
 - **症状**: 重启 vLLM 加新参数（如 `--enable-prefix-caching`）后系统卡住、无法响应
 - **根因**: vLLM 新参数可能触发 CUDA kernel 重新编译，编译期间如果有并发请求涌入会导致争抢卡死
 - **修复**: 重启 vLLM 前必须：
@@ -182,7 +271,106 @@ tail -3 ~/.hermes/logs/gateway.log
   ```
 - **验证**: 确认 vLLM 启动日志无 CUDA 编译错误，且单请求测试通过后，再开放外部访问
 
-### 2026-07-18 (p3)
+### 9. flashinfer FP4 GEMM 内核编译 OOM（GB10 / sm_121a）⚠️
+- **症状**: vLLM 重启后卡在 `Using FlashInfer for top-p & top-k sampling`，然后 `Engine core initialization failed`。日志中大量 `Killed`（exit 137）和 `ninja: build stopped: subcommand failed`
+- **根因**: flashinfer 0.6.13 的 FP4 GEMM 内核需要针对 sm_121a (GB10/Blackwell) JIT 编译 18 个 CUDA kernel。nvcc 的 cicc 子进程每个消耗 ~5GB RAM，并行时快速耗尽系统内存触发 OOM Killer
+- **为什么会发生**: 删除 `~/.cache/flashinfer/0.6.13/121a/` 或换 vLLM 参数（如 `--enable-prefix-caching`）后会触发重编译。旧缓存中的预编译内核一旦丢失，重新编译就失败
+- **修复**:
+  ```bash
+  # 1. 停所有 vLLM 进程 + 编译器残留
+  pkill -9 -f vllm; pkill -9 -f cicc; pkill -9 -f nvcc; sleep 3
+  # 2. 清除锁文件（关键！残留锁文件会导致 ninja 跳过或死锁）
+  rm -rf /home/hehua/.cache/flashinfer/0.6.13/121a
+  # 3. 严格限制并行度（必须在 build.ninja 首次生成时设置）
+  MAX_JOBS=1 NINJA_JOBS=1 NVCC_THREADS=1 OMP_NUM_THREADS=1 \
+  /usr/bin/python3 -m vllm.entrypoints.openai.api_server \
+    --model ... --quantization modelopt --enforce-eager
+  # 4. 编译需 10-15 分钟，确保 >50GB 空闲内存
+  # 5. 等待 API 就绪后再恢复外部流量
+  ```
+- **关键细节**: `MAX_JOBS=1` 必须在**缓存完全清除后**第一次启动时设置（此时 build.ninja 被生成）。如果 build.ninja 已存在，ninja 会沿用之前的并行度，`MAX_JOBS` 被忽略
+- **编译成功后缓存持久化**: 内核存入 `~/.cache/flashinfer/0.6.13/121a/cached_ops/fp4_gemm_cutlass_sm120/`（约23MB）。后续重启（包括加 `--enable-prefix-caching`）无需重编译，仅 2 分钟模型加载即可就绪
+- **prefix caching 实测效果**: 当前版本（flashinfer 0.6.13 + vLLM 0.25.1）可正常工作。但因 system prompt 仅 ~500 tokens，每次节省约 3-5s。总耗时 130s→92s，硬件瓶颈（Qwen3-32B 约 10 tps）未突破
+  ```bash
+  pip3 uninstall flashinfer -y
+  TORCH_CUDA_ARCH_LIST="9.0;12.0f" pip3 install flashinfer --no-build-isolation
+  ```
+  之后加 `--enable-prefix-caching` 无需额外编译
+- **预防**: 不要随意删除 `/home/hehua/.cache/flashinfer/` 目录。如果必须清理，按上述步骤用严格单线程重新构建
+
+### 11. 跨机器操作 — 微信发送命令到远程服务器
+- **场景**: 需要在新加坡/阿里云服务器上操作（改配置、重启服务），但智能体无 SSH 权限
+- **方法**: `hermes send -t weixin "命令"` 发给用户微信，用户复制粘贴到终端执行
+  ```bash
+  # 需先配置 WEIXIN_HOME_CHANNEL
+  hermes config set WEIXIN_HOME_CHANNEL "o9cq80y199Sltjv-FUzM2TAbW75Y@im.wechat"
+  # 然后发送
+  hermes send -t weixin "sudo sh -c 'echo \"Allow 112.28.117.8\" >> /etc/tinyproxy/tinyproxy.conf' && sudo systemctl restart tinyproxy"
+  ```
+- **注意**: 频率限制 30s 冷却。服务器用 `admin` 用户（非 root），需 `sudo`
+
+### 12. vLLM 端口被旧进程幽灵占用 ⚠️
+- **症状**: 新 vLLM 启动报 `OSError: [Errno 98] Address already in use`，但 `ps aux | grep vllm` 显示无残留进程，`ss -tlnp | grep 8200` 却仍显示端口被占用
+- **根因**: `kill -9 <pid>` 后进程可能已从 ps 列表消失，但 socket 未立即释放（TCP TIME_WAIT 或子进程持有了 fd）。`kill -9 $(pgrep ...)` 因匹配到自身而失败也是常见原因
+- **修复**: 
+  ```bash
+  # 方法1：按端口杀（最可靠）
+  fuser -k 8200/tcp
+  sleep 3
+  ss -tlnp | grep 8200 || echo "✅ 端口已释放"
+  
+  # 方法2：三重保障
+  pkill -9 -f vllm.entrypoints
+  fuser -k 8200/tcp 2>/dev/null
+  sleep 3
+  # 再次确认
+  pgrep vllm || echo "✅ 无 vLLM 残留"
+  ss -tlnp | grep 8200 || echo "✅ 端口已释放"
+  ```
+- **陷阱**: `kill -9 $(pgrep -f vllm)` 可能因 pgrep 匹配到自己而返回 exit code -9，需分开写或用 `pkill`
+
+### 13. RAG health 正常但分析返回 500 Internal Server Error ⚠️
+- **症状**: `curl /health` 返回 `{"status":"ok"}` 一切正常，但 `POST /clinical/assist` 返回 `500 Internal Server Error`（纯文本，非JSON）。前端报 `JSON.parse: unexpected character at line 1 column 1`
+- **根因**: RAG 进程进入了异常状态（可能因之前的 LLM 调用异常未正确处理导致内部状态损坏），health 端点不经过 LLM 调用所以正常，但分析端点触发 LLM 时崩溃
+- **诊断三步法**:
+  1. health 正常但分析 500 — 这是关键信号，直接指向进程内部状态损坏
+  2. 不要改代码！这种模式下代码没问题，是运行时状态问题
+  3. 查看日志 — 如果进程是 Hermes bg 启动的，stderr 走 pipe 看不到错误；需用文件日志重启
+  ```bash
+  # 确认症状
+  curl -s http://127.0.0.1:18790/health        # ✅ ok
+  curl -s -X POST http://127.0.0.1:18790/clinical/assist \
+    -H "Content-Type: application/json" \
+    -d '{"patient_name":"蔡维良"}'               # ❌ Internal Server Error
+  ```
+- **修复**: 直接重启 RAG 服务（不需要改代码）
+  ```bash
+  systemctl --user restart rag-service.service
+  sleep 6
+  curl -s http://127.0.0.1:18790/health
+  ```
+- **重启方式 (2026-07-19起)**: 使用 `systemctl --user restart rag-service.service`。不再需要 nohup/terminal(background=true) 等变通方式
+- **关键教训**:
+  - **永远先用 curl 测试后端直接返回**，不要只看前端报错就改代码
+  - 此模式与「max_tokens截断」「timeout超时」的区别：那些会在日志中留下线索（raw_response不完整、超时错误），而本模式日志完全干净，只有重启能解决
+  - 若 5 分钟内反复出现此问题，说明代码中有未捕获的异常路径，需要加固异常处理
+- **关键纠正**: prefix caching **可在 flashinfer 0.6.13 + GB10 上运行**，前提是 MAX_JOBS=1 完成初次编译。编译后的缓存持久化，后续重启 2 分钟即可（含 `--enable-prefix-caching`)
+- **效果**: 仅省 ~5s（system prompt prefill 占比很小），总耗时 130s→93s（-28%），硬件瓶颈（10 tps）未突破
+- vLLM 0.25.1 与 flashinfer-python 0.6.13 强绑定，不能独立升级
+- **新增**: 第11节 \"跨机器操作\" — hermes send -t weixin 发命令到用户微信
+
+### 2026-07-20
+- **新增**: 第16节 "用户报卡住/无反应，后端日志全绿 → 问题在前端" — journalctl 三分支判定法（无请求=前端没发 / 全200=后端无罪 / 有请求无返回=后端真卡），含中医辨证 Tab switchTab 缺分支病例
+- **第16节扩充**: 分支2（全200）新增第四种嫌疑「前端遮罩泄漏」+ 病例2（`reanalyzeWithCode` 只 add 不 remove，页面永转圈）；`grep -n "loadingIndicator"` 核对 add/remove 配对法；术语对齐教训（用户"二次分析"=改诊断/操作后重分析）
+- 配套更新：clinical-assist-system 修改规范新增前端附加规范（Tab 三触点、改 HTML 必重启、Ctrl+F5 交付提醒）
+
+### 2026-07-18 (p4 - health正常但分析500)
+- **新增**: 第13节 "RAG health正常但分析返回500" — 进程内部状态损坏的完整诊断+修复流程
+- **教训**: 永远先用 curl 测试后端直接返回，不要只看前端报错就改代码
+
+### 2026-07-18 (p3 - prefix caching 尝试)
+- **新增**: 第9节 "flashinfer FP4 GEMM 内核编译 OOM" — sm_121a/GB10 上 JIT 编译的完整修复流程（MAX_JOBS=1 + 锁清理 + 内存要求）
+- 确认 `--enable-prefix-caching` 在 flashinfer 0.6.13 + GB10 上不兼容，需等升级
 - **新增**: 第8节 "LLM Prompt 精简法" — 三步法减少输出 token 降低延迟，含前端兼容性陷阱
 - **新增**: 日志混淆问题 — nohup vs Hermes bg 启动，stdout 走不同通道，tail 旧日志会误导
 - **新增**: TIMER 打点法 — 性能瓶颈定位（Oracle/向量/LLM 三段计时）

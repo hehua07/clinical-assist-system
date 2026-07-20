@@ -6,8 +6,12 @@
 
 | Skill | 用途 | 行数 |
 |:--|:--|--:|
-| `clinical-assist-system` | 系统架构、组件状态、操作手册、修改规范 | ~290行 |
-| `rag-repair-lessons` | 已知故障根因、修复方案、排查流程、性能优化 | ~200行 |
+| `clinical-assist-system` | 系统架构、组件状态、操作手册、修改规范（含 references/ 专题文档与 scripts/） | ~720行 |
+| `rag-repair-lessons` | 已知故障根因、修复方案、排查流程、性能优化 | ~390行 |
+| `spark-network-topology` | Spark/阿里云/新加坡三服务器拓扑、SSH、frp 端口映射、nginx 路由（含报告查询与 dashboard 共存规则） | ~360行 |
+| `aliyun-nginx-proxy-location` | 阿里云 nginx conf.d 反代配置工作流与瘫痪修复案例 | ~270行 |
+| `hermes-env-provider-troubleshooting` | Hermes .env 格式与 provider 路由问题诊断 | ~290行 |
+| `remote-server-config` | 远程服务器（VPS/云实例）配置通用流程 | ~170行 |
 
 ## 安装
 
