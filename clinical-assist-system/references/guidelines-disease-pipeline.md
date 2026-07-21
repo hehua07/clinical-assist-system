@@ -62,6 +62,39 @@ rsync -az --delete curated/display/ root@47.102.41.191:/var/www/hhysjt/guideline
 7. **v3 导入块级全局去重**：跨文档同一文本块只留一份（首轮跳过 192 块），消除"同指南多来源"残留重复向量。
 8. **前端改动验证要带 307+登录**：`curl /clinical/` 会 307→`/clinical`（无尾斜杠）再 302→/login；空响应≠旧版本。验证法：POST /login 取 `clinical_session` cookie → `-H "Cookie: ..."` 请求 `/clinical`（无斜杠）→ grep 标志串 ≥1。
 
+## 网站为源同步架构（2026-07-21 session 31 需求4 起，向量库维护的主路径）
+
+**网站 `https://www.hhysjt.com/guidelines/display/` 是指南全文的单一事实源（single source of truth）**。日常维护不再走"停服→import_knowledge_base_v3 全量导库"（那条路只剩灾难重建/初次建库用）；向量库由 `sync_guidelines_from_web.py` 每日从网站增量同步：
+
+```
+curate（治理/展示页生成）→ rsync --delete 上站 → sync_guidelines_from_web.py（网站→向量）
+                                                    ↑ cron 4da787a0f65d 每日04:10 自动跑
+```
+
+### sync_guidelines_from_web.py（/home/hehua/guidelines_scraper/）
+
+- **流程**：抓 index.html 解析页面清单 → 逐页抓取 → 提取 `gd-*` 机器 meta（year/publisher/journal/url/kept/family，curate 的 DISPLAY_TMPL 生成）+ `<article>` 正文 → 剥 md frontmatter → `clean_for_vector()` 清洗（复用 curate 规则，剔参考文献）→ md5 哈希比对 → 变更页删旧块+800/100 分块+qwen3-embedding+upsert；**网站上消失的页 → 按 local_url 扫库删向量**（相对/绝对双形态兼容）
+- **local_url 一律写绝对地址** `https://www.hhysjt.com/guidelines/display/<slug>.html`（临床助手"原文链接"可直接点、可微信分享打开）
+- **state**=`web_sync_state.json`（slug→hash/chunks/title，逐页落盘；删之=强制全量重建 ~15min/3000块）
+- **flock 单实例锁** `/tmp/guidelines_websync.lock`——⚠️ **chroma 同库多写进程必坏**（session 31 晚事故：4 个幻影并发同步进程+pkill -9 → HNSW 段文件撕裂，集合读取即 SIGSEGV；取证见 `chromadb-segment-corruption-rebuild.md`）。任何写 chroma 的脚本都必须带单实例锁，且**绝不并发跑**
+- **collection 用 `get_or_create_collection` 且 metadata 必须带 `hnsw:space: cosine`**（0.58 相关度阈值体系依赖；缺了空间度量默认 l2，阈值全乱）
+- 中文文件名 URL 必须 `urllib.parse.quote(url, safe=":/?#[]@!$&'()*+,;=%")`，否则 urllib 抛 ascii 编码错
+- 输出规范（cron no_agent 看门狗）：无变更静默；有变更/失败打印汇总（deliver=all 推微信）；索引不可达或失败率>20% 非零退出
+- **增量不停服**：只 delete/upsert 既有集合（rag-service 无需重启）；唯一例外=集合 delete+recreate 后服务 init 期缓存的 `coll_guidelines` 句柄失效，必须重启 rag-service 重绑
+
+### 下架坏条目标准流程（JUNK_FILES 机制，session 31 实测 8 篇）
+
+1. 从 `curated/guidelines_curated.json` 拿坏条目的 `orig_md` 文件名（含 URL 哈希前缀，如 `htmlaf008a28`）
+2. 把哈希前缀加进 `curate_guidelines.py` 的 `JUNK_FILES` 元组（**按文件哈希而非标题排除**——同标题不同源有好有坏，如痔病 2020 两个源一残一全）
+3. 重跑 curate：坏条目在**过滤阶段**（家族竞选之前）被剔除 → **同族全文版自动扶正**（痔病换上 2025 中西医全文版、胆道感染换上 2021 版，均为淘汰池兄弟自动晋级）；无兄弟的（付费墙/抓取残缺）出库待重抓
+4. 清孤儿：display/clean 目录里不在新 curated 集合的旧文件手动删（curate 只写不删）
+5. `rsync -az --delete curated/display/ root@47.102.41.191:/var/www/hhysjt/guidelines/display/` 上站
+6. 下一次 sync 自动从向量库删掉下架页的块（无需手工动向量）
+
+### 审计全文覆盖的快查法
+
+`guidelines_curated.json` 自带 `chars_clean` 字段：排序列出 <3000 字的逐篇目检——指南全文正常 5000+ 字；1000-3000 字的多为导航垃圾/摘要页/付费墙著录/新闻稿（注意：临床路径类本身短，2460 字属正常勿误杀）。
+
 ## 微信收料通道（2026-07-21 session 27 需求1c，ingest_single_guideline.py）
 
 用户平时工作中发现指南/共识/高价值资料，经微信发链接给助理。标准动作（不要手工走全流程）：
