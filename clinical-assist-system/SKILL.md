@@ -15,7 +15,7 @@ platforms: [linux, macos, windows]
 | vLLM | ✅ 运行 | Qwen3-32B-NVFP4, :8200, max-model-len=16384, **prefix caching 已启用** |
 | RAG服务 | ✅ 运行 | :18790, systemd用户服务(开机自启), 路径 /home/hehua/rag-service.bak/ |
 | Ollama | ✅ 运行 | :11434, qwen3-embedding (v0.32.1, **GPU模式**) |
-| ChromaDB | ✅ 运行 | dip_rules=4481, settlement_2025=4704, **guidelines=3192（138篇·治理版v3；session 27 注入 /clinical/assist 推理链，session 29 实测生效：quick/detail 自动对齐 top2 指南并返回 guideline_refs）**, compliance=4, tcm_knowledge=3438 |
+| ChromaDB | ✅ 运行 | dip_rules=4481, settlement_2025=4704, **guidelines=3192（138篇·治理版v3；session 27 注入 /clinical/assist 推理链，session 29 实测生效：quick/detail 自动对齐 top2 指南并返回 guideline_refs）**, compliance=4, tcm_knowledge=3438, **emr_cases=38293（10195份文书·session 30 已接入推理链：quick/detail 注入 top3 相似病历并返回 emr_case_refs）** |
 | LLM引擎 | 🌐 DeepSeek在线（主） | `RAG_LLM_PROVIDER=online`（.env），DeepSeek→GLM→本地vLLM自动降级 + 调用前脱敏；回切本地改 .env 一行重启。实测 quick 6s/detail 7s |
 | 前端页面 | ✅ 全部正常（2026-07-20 session 19 再修复 /report/） | `https://www.hhysjt.com/clinical/`、`/guideline/search`、`/guidelines/`、`/report/` 公网全部 200，HTTP→HTTPS 301 正常。修复：SSH 直连（公钥已装）+ 本地构建 + scp 上传 hhysjt.conf（基于 bak4 + 收回悬空 location + 新增 /guideline 反代）→ nginx reload。**此后阿里云操作走 SSH 不再走 Workbench**，见 aliyun-nginx-proxy-location skill |
 | dip_operations | ✅ 正常 | 淮南分值库操作列表(20+条)，按分值降序 |
@@ -631,6 +631,13 @@ CLINICAL_SESSION_HOURS=12
 4. **验收**：`git diff` 全量审查 + `py_compile`（Python）→ 按「修改规范」批量一次重启 → 公网 curl grep 标志串 ≥1 → 微信汇报。**opencode 的产出同样受上方「修改规范」全部条款约束**（改前备份、readback 落盘验证、遮罩泄漏检查、线上验证才算交付）。
 
 ## Changelog
+
+### 2026-07-21 (session 30 - 需求5接入：相似病历入推理链，已上线公网)
+- **功能**：`_emr_cases_context()`（rag_service.py L2442）——检索 emr_cases（n=12）→按 emr_id 去重→**距离阈值 0.65**（实测标定：覆盖内 0.45-0.58、覆盖外 ≥0.72）→top3×500字摘录注入 `/clinical/assist` quick/detail prompt；QUICK/DETAIL 系统提示词各加【相似病历参考】条款（思路/格式参考，不替代指南与临床判断）；响应带 `emr_case_refs`（doc_type/emr_date/dept/diagnoses/relevance/snippet150字）；前端 `renderEmrCaseRefs`（关键提醒区"📁本次分析参考的本院相似病历"），quick/detail 两渲染路径均挂接
+- **⚠️ ChromaDB EF 冲突陷阱（新故障模式）**：ingest 脚本建集合时**未传 embedding_function** → 持久化 EF=default；rag_service 用 `_get_coll`（带 ollama EF + hnsw:space=cosine）get_or_create 即抛 `Embedding function conflict: new: ollama vs persisted: default`，服务启动崩溃循环。解法：`client.get_collection()` 不带 EF + 查询点显式 `vs.ef([query])` 传 `query_embeddings`（与建库同模型）。**教训：新建集合时必须传 embedding_function，否则消费端只能走显式嵌入路径**
+- **冒烟（全过）**：quick 12.0s emr_refs=3（胆囊相关病程/入院记录）+指南2+dip3；detail 14.0s emr_refs=3、病程235字、医嘱8条；**覆盖外病种（主动脉夹层）emr_refs=0 正确拒噪**；前端本机标志串 3、公网 3
+- **公网验证方法修正**：cookie 按域名隔离——本机登录的 cookie 对 www.hhysjt.com 无效，公网验证须向 `https://www.hhysjt.com/login` 重新取 cookie（session 25 的方法论补充）
+- 备份 `*.bak.20260721_173437`；rag-service 与技能仓均已提交推送
 
 ### 2026-07-21 (session 29 - 六需求全量实测闭环 + 病历向量化启动 + 双仓提交)
 - **生效契机**：今晨 09:00 机器重启，systemd 用户服务自动拉起 rag-service，session 27/28 落盘代码全部载入——"待重启"状态由开机自动解决
