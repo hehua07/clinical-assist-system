@@ -261,6 +261,8 @@ wc -l /etc/nginx/conf.d/hhysjt.conf
 - 备份文件用日期后缀 `.bak.$(date +%Y%m%d)`，方便识别
 - 重写后一定测试 HTTP **和** HTTPS 两个协议，SSL 部分可能因 server 块边界错误而受影响
 - 本机测试通过公网访问：`curl -sI http://www.hhysjt.com/...`
+- ⚠️ **该服务器 nginx 是手动启动的，不归 systemd 管**（2026-07-20 实测：`systemctl reload nginx` 报 `nginx.service is not active, cannot reload`，改完配置不会生效但 `&&` 链会静默中断）。reload 只能用 `nginx -s reload`；验证 reload 是否真生效看 worker 启动时间：`ps -o pid,lstart,cmd -C nginx`
+- ⚠️ **反代 WebSocket 端点（如 hermes dashboard /api/）必须改写 Origin**：`proxy_set_header Origin "http://127.0.0.1:<后端端口>";`。hermes 后端校验 WS 握手的 Origin 必须等于 bind 地址，浏览器发来的公网域名 Origin 会被 403 拒绝，前端表现为 `Chat connection interrupted (code 1006)` 循环重连（2026-07-20 修）。升级四件套之外记得加这行：`proxy_http_version 1.1` + `Upgrade $http_upgrade` + `Connection "upgrade"` + `Origin http://127.0.0.1:端口`
 
 ## 本机 frp 隧道检查
 

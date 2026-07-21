@@ -7,9 +7,28 @@
 | 「🤖 生成AI建议」主按钮 | `submitAssist()` | `quick` | 首诊：诊断+鉴别+检查建议（2026-07-20 起输出去 DIP） |
 | 结果页底部「🔍 二次分析」按钮 | `submitDetail()` | `detail` + `prior_analysis`（回传首诊 JSON） | 医嘱+合规+病程，与首诊一致 |
 | 诊断/操作下拉旁「🔄 重新分析」 | `reanalyzeWithSelection()` | `quick`（2026-07-20 起，原为不带 mode 走 full 11s+） | 带选中诊断/操作重跑首诊，~6s |
-| 操作候选/参考的「选用」按钮 | `selectOperation()` → `reanalyzeWithCode()` | `quick`（2026-07-20 起） | 带 selected_operation 重跑首诊 |
+| 操作候选/参考的「选用」按钮 | `selectOperation()` → `reanalyzeWithCode()` | `quick`（2026-07-20 起） | 带 selected_operation 重跑首诊。**⚠️ payload 硬编码 `description:''`（1831–1836 行）**——检索失去首次分析的语义锚点，见下节 |
 
 full 模式（旧 10 字段大 prompt）自此无前端入口，仅作后端兜底。
+
+## ⚠️ 加选后参考列表消失（不卡死、不报错）= 检索锚点丢失（2026-07-21 确诊，未修复）
+
+「选用」路径发的请求**不带病情描述**（`description:''`），而后端 `search_query` = description + 姓名/主诉 + HIS 诊断（rag_service.py 2410–2416）。当 visit 无 EMR 诊断（近 7 天住院约 6%）且主诉为空时，查询串退化为无语义文本，向量命中全低于 0.55 阈值 → `dip_operations`/`settlement_operations` 空 → `renderOperationReferences` 静默 return（HTML 1766 行），参考区整块消失。**有诊断的 visit 加选完全正常**（A/B 实测三种 payload 均返回数据）。与「遮罩泄漏」的鉴别：遮罩泄漏 = 数据已渲染但被转圈盖住；本条 = 响应 200 但列表字段为空、区域被前端主动隐藏。次因：HIS 诊断码含 `x`（`I10.x00x002`）使后端提取正则失效，精确匹配路径名存实亡。完整 RCA 与修复建议见 `references/operation-reselect-empty-rca.md`。
+
+## 登录态直调端点 A/B 复现法（2026-07-21 新增）
+
+鉴权上线后 curl 直调需先取 cookie；按前端真实 payload 逐字段对照调用、一次只变一个字段，是区分"前端发错/后端算错"的最快手段：
+
+```bash
+curl -s -c /tmp/ck.txt -X POST http://localhost:18790/login -H 'Content-Type: application/json' \
+  -d '{"username":"<账号>","password":"<密码>"}'        # 账号在 .env CLINICAL_USERS，凭据不入库
+# A：模拟首次分析（带 description）
+curl -s -b /tmp/ck.txt -m 300 -X POST http://localhost:18790/clinical/assist -H 'Content-Type: application/json' \
+  -d '{"description":"...","patient_name":"...","visit_id":"...","mode":"quick"}'
+# B：模拟选用（description 空 + selected_operation）——与 A 对比 dip_operations/settlement_operations 数量
+curl -s -b /tmp/ck.txt -m 300 -X POST http://localhost:18790/clinical/assist -H 'Content-Type: application/json' \
+  -d '{"description":"","patient_name":"...","visit_id":"...","selected_operation":"51.2300","mode":"quick"}'
+```
 
 「二次分析」的词义陷阱：**2026-07-20 用户亲口纠正——他说的「二次分析」= 更改主诊断/主操作后的重新分析（③/④），不是②**。报"二次分析卡住"时先确认指的是哪个按钮，别按自己改造时的新定义对号入座。
 

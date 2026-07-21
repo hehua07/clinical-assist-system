@@ -1,9 +1,9 @@
 # 病种驱动指南共识管线（disease_pipeline.py）
 
 需求4 产物（2026-07-20 session 23）。以结算 Top 病种为关键词自动建设指南/共识全文库：
-**AnySearch 发现 → 全文抓取 → guidelines.json → curate_guidelines.py 治理 → import_knowledge_base_v3 向量化 → rsync 展示页上网站**。
+**AnySearch 发现 → 全文抓取 → guidelines.json → curate_guidelines.py 治理 → import_knowledge_base_v3 向量化 → rsync 展示页上站**。
 
-⚠️ 2026-07-21 起，v2 导入已废弃。新增治理层 `curate_guidelines.py`（用户五条规则：近3年时效/同族新版优先(更新件除外)/同源择优/参考文献清洗/网页展示完整原文含参考文献），产出 `curated/guidelines_curated.json`+`clean/`+`display/`。v3 导入按块级全局去重，元数据带 year/local_url/kept_as。
+⚠️ 2026-07-21 起 v2 导入废弃：新增治理层 `curate_guidelines.py`（用户五条规则：近3年时效/同族新版优先·更新件除外/同源择优/参考文献清洗/网页展示完整原文含参考文献），产出 `curated/{guidelines_curated.json, guidelines_dropped.json, clean/, display/}`；v3 导入带块级全局去重，元数据含 year/local_url/kept_as。治理层数据坑见末节。
 
 ## 文件清单
 
@@ -13,9 +13,9 @@
 | `pipeline_urls.json` | discover 产物：候选 URL 池（含 disease/title/type） |
 | `pipeline_state.json` | 断点状态：`done` 列表 + `failed` {url: 次数} |
 | `pipeline_full.log` | 运行日志 |
-| `content/guidelines.json` | 合并后的总索引（202 条，pub_date 字段是抓取年不可信，年份以标题解析为准） |
-| `curate_guidelines.py` | 治理脚本：家族分组(标准号/归一化标题/prefix合并)+时效+择优+清洗+展示页导出 |
-| `import_knowledge_base_v3.py` | 治理产物向量化（替代 v2） |
+| `content/guidelines.json` | 合并后的总索引（202 条；pub_date 是抓取年不可信，年份以标题解析为准） |
+| `curate_guidelines.py` | 治理脚本：家族分组(标准号code/归一化标题/prefix合并)+时效+同源择优+错抓检测+参考文献清洗+展示页导出 |
+| `import_knowledge_base_v3.py` | 治理产物向量化（替代 v2；块级全局去重；元数据 year/local_url/kept_as） |
 | `content/*.md` | 全文 Markdown（文件名含 `**原文**` URL frontmatter） |
 
 ## 运行方式
@@ -25,9 +25,9 @@ cd /home/hehua/guidelines_scraper
 /usr/bin/python3 disease_pipeline.py --discover [--top N]   # 病种检索 → pipeline_urls.json
 /usr/bin/python3 disease_pipeline.py --fetch                # 断点续抓全文 → md + 合并 json
 /usr/bin/python3 disease_pipeline.py --all                  # 两步连跑
-/usr/bin/python3 curate_guidelines.py                     # 治理: curated/{clean,display,*.json}（只读原始库）
-systemctl --user stop rag-service.service                   # 停服避免集合句柄冲突
-/usr/bin/python3 import_knowledge_base_v3.py                # 向量化 guidelines（~10min，块级去重）
+/usr/bin/python3 curate_guidelines.py                     # 治理: 只读原始库 → curated/{clean,display,*.json}
+systemctl --user stop rag-service.service                 # 停服避免集合句柄冲突
+/usr/bin/python3 import_knowledge_base_v3.py              # 向量化 guidelines（~10min，块级全局去重）
 systemctl --user start rag-service.service
 rsync -az --delete curated/display/ root@47.102.41.191:/var/www/hhysjt/guidelines/display/  # 展示页上站
 ```
@@ -50,6 +50,40 @@ rsync -az --delete curated/display/ root@47.102.41.191:/var/www/hhysjt/guideline
 
 **4. 域名质量**
 文档分享站（renrendoc/book118/max.book118/cancer361/ye8.net）出 Preview 垃圾，已入 BLACKLIST；付费/摘要站靠 1500 字下限兜底。发现阶段每病种 2 条 query ×8 结果取前 6。
+
+## 治理层 curate_guidelines.py 数据坑（2026-07-21 首轮全踩过，改规则前先读）
+
+1. **抓取日污染发布年**：pipeline md frontmatter `**日期**: 2026-07-20` 是抓取日非发布日，82 篇年份曾因此全标 2026。年份证据优先级：标题年份 > frontmatter日期(≠文件名抓取日才采信) > 正文出版日期 > 期刊引用年（杂志, YYYY）> URL 路径年（uploads/2025/）。
+2. **8位时间戳干扰年份正则**：`胃息肉病-202504100821` 会误判 2025——年份正则必须带 lookaround `(?<!\d)((?:19|20)\d{2})(?!\d)`。
+3. **JSON 标题截断**：AnySearch 标题被截（如"指南共识_《中国慢性胆囊炎、胆囊结石内科"）→ 归一化族键变短、精确匹配无法成族。修法：prefix-merge（短键≥8字且是长键前缀则并族）+ 展示标题用 md 文件 H1 补全。
+4. **标准号标题需独立族键**：`T_CACM1209-2019...` 按标题归一化会把全部 T_ 文档并成一族团灭（11 部中医指南险些全灭）——用标准号 `code:CACM1209` 作族键。
+5. **错抓检测（标题↔正文不符）**：zgsyz.com 两篇文章正文错抓成 COVID 文（标题是肿瘤/直肠癌共识）。检测：标题去通用词后取≥2字疾病词，正文头部+中部采样零命中 → 判错抓淘汰（首轮淘汰 10 篇）。
+6. **部分更新保护要带年份条件**："新版仅更新件则留旧版"规则若不看年份，会把同年不同源的长版本误判为旧版全文双保留（胆囊 2018 双份事故）。守卫：仅当 newest.year > older.year > 0 才触发。
+7. **v3 导入块级全局去重**：跨文档同一文本块只留一份（首轮跳过 192 块），消除"同指南多来源"残留重复向量。
+8. **前端改动验证要带 307+登录**：`curl /clinical/` 会 307→`/clinical`（无尾斜杠）再 302→/login；空响应≠旧版本。验证法：POST /login 取 `clinical_session` cookie → `-H "Cookie: ..."` 请求 `/clinical`（无斜杠）→ grep 标志串 ≥1。
+
+## 微信收料通道（2026-07-21 session 27 需求1c，ingest_single_guideline.py）
+
+用户平时工作中发现指南/共识/高价值资料，经微信发链接给助理。标准动作（不要手工走全流程）：
+
+```bash
+cd /home/hehua/guidelines_scraper
+/usr/bin/python3 ingest_single_guideline.py "<URL>" [--title 手动标题] [--publisher 发布机构] [--journal 期刊名] [--no-sync]
+```
+
+脚本自动完成：三路抓取（pdf/medlive/AnySearch extract，复用 disease_pipeline）→ 按 pipeline 格式存 `content/YYYY-MM-DD_hash_标题.md` + 增量并入 `content/guidelines.json`（按 URL 幂等去重）→ **重跑 curate 全量治理**（家族去重/时效/清洗/展示页/索引全自动；新文档可能顶掉同族旧版或被判淘汰，行为与批量治理一致）→ 在新 curated.json 中按 URL 定位本篇 → 增量向量 upsert（先按 url 删旧块再加新块，**集合不重建、服务不用停**）→ rsync 展示页上站（--delete 镜像）→ 打印确认摘要（标题/年份/kept_as/块数/向量总数/site_sync）。
+
+- 文档被治理淘汰时脚本打印原因（正文不足/抓取错位/解读类），回复用户"该链接未通过质量关卡"并附原因。
+- 同 URL 重发安全：guidelines.json 幂等、向量先删后加，不会重复。
+- 实测：2026-07-21 以 medsci 链接跑通全程（7287字→保留为全文-最新版→10块→rsync ok），库 138→139 篇。
+- 收料后顺手更新一次覆盖核查（见下节）。
+
+## 病种覆盖核查与缺口通知（2026-07-21 session 27 需求1b）
+
+- 病种清单：`disease_pipeline.py` 内 TOP 病种 34 个（结算口径）。
+- 核查法：每病种配同义词表，对 `curated/guidelines_curated.json` 标题模糊匹配；**弱覆盖**判定=最佳匹配年份<2018或未知、标题带乱码/竖线垃圾、仅地方/团体/解读类单篇。
+- 首查（session 27）：34/34 标题级全覆盖；7 个弱覆盖（膀胱结石/短暂性脑缺血发作/翼状胬肉/胆管结石/带状疱疹/肩周炎/颈椎病）已一次性微信通知用户人工核实。
+- **一次性微信通知固定做法**：no_agent 脚本直出（如 `~/.hermes/scripts/guideline_gap_report.py`）+ 一次性 cron（schedule '1m', repeat=1, deliver='all'），微信端即收到；job 跑完自动消失属正常。
 
 ## AnySearch 使用要点
 
