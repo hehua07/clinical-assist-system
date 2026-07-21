@@ -632,7 +632,7 @@ CLINICAL_SESSION_HOURS=12
 ### 2026-07-21 (session 29 - 六需求全量实测闭环 + 病历向量化启动 + 双仓提交)
 - **生效契机**：今晨 09:00 机器重启，systemd 用户服务自动拉起 rag-service，session 27/28 落盘代码全部载入——"待重启"状态由开机自动解决
 - **冒烟实测（全部通过）**：①前端 5 标志串 grep 全中（出院小结/指南对齐渲染/关联操作/来源网站/代入患者病情）②quick 15.2s 返回 guideline_refs=2（胆石症共识2025+胆囊炎共识2025）、dip 3 条带推荐附加操作 ③detail 17.3s 药占比核算（215元/18.6%）+控费标杆测算（1774.31分×0.65299≈1158元）+病程 184 字+医嘱 8 条 ④出院小结 4.6s 七字段+公众号尾注 ⑤指南检索带年份/来源字段
-- **需求5 启动**：`ingest_emr_records.py` 后台跑批（EMR 四类文书近24个月 → `emr_cases` 集合，断点续跑）；`.gitignore` 增加 `emr_ingest_state.json`
+- **需求5 启动**：`ingest_emr_records.py` 后台跑批（EMR 四类文书近24个月 → `emr_cases` 集合，断点续跑）；`.gitignore` 增加 `emr_ingest_state.json`。**首跑 ORA-01722 修复**：EMR.ID 是 VARCHAR2 字母数字混编（如 `0G3VI0JE5UUHQN8P`），非数字——`ID > :int` 触发隐式 TO_NUMBER 全表转换报错；且 Oracle 空串=NULL（`ID > ''` 永远无行），首轮分页须在 SQL 层省略 `ID > :6` 条件。修复：字符串键控分页 + 条件 SQL，冒烟 50 文档/191 块通过后全量启动
 - **技能双写 reconcile**：逐一 diff 五个技能确认活跃侧全为仓侧超集（session 27 前半仓侧内容已含于活跃侧），rsync 活跃→仓后推 master；rag-service 推 main
 - **指南注入链路确认**：`_guideline_context()`（L2400）检索→文档去重→阈值0.58→top2×550字摘录注入 quick/detail prompt；系统提示词【指南对齐】条款要求引用注明指南名+年份；失败静默降级不拖垮分析；refs 只回元数据（摘录仅进 prompt 是设计如此）
 
