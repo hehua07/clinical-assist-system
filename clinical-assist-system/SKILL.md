@@ -1,7 +1,7 @@
 ---
 name: clinical-assist-system
 description: "寿县和华医院临床AI辅助系统（RAG + vLLM + DIP匹配）的调试记录、当前状态、已知问题和修复方案。任何智能体对系统进行修改后，必须更新此技能。"
-version: 1.16.0
+version: 1.16.1
 author: hehua
 platforms: [linux, macos, windows]
 ---
@@ -139,6 +139,7 @@ journalctl --since "today" | grep "Scheduled restart" | head -10
 | Prompt 内容地图与割肉史 | `references/prompt-content-map.md` | 首诊 prompt 各段截断规格（行号）、为本地速度精简掉的指令/字段清单、max_tokens 轨迹、恢复建议 |
 | Oracle EMR 数据模型 | `references/emr-data-model.md` | 病历批量向量化摸底（2026-07-21）：EMR+EMR_ELEMENT 文书中心、各表行数/近一年量/文本长度、DRG_UPLOAD_HN_* 已停更、出院小结存在性、脱敏字段清单、批量导出路径 |
 | 加选无数据 RCA | `references/operation-reselect-empty-rca.md` | 选用按钮后参考列表空的根因（description 检索锚点丢失 + x 诊断码正则失效）、A/B 实测证据、修复建议、登录态直调端点复现法（2026-07-21 只读分析，未修复） |
+| Oracle HIS 查询陷阱 | `references/oracle-his-query-pitfalls.md` | EMR.ID 是 VARCHAR2 字母数字混编（ORA-01722 隐式 TO_NUMBER）；Oracle 空串=NULL 致分页首轮静默 0 行（条件 SQL 写法）；写查询前先探 ALL_TAB_COLUMNS 列类型 |
 
 ### 2. 讯飞Spark API Key 授权失效
 - **报错**: `AppIdNoAuthError (code=11200)`
@@ -160,6 +161,8 @@ journalctl --since "today" | grep "Scheduled restart" | head -10
 ## Skills 分发仓库
 
 ⚡ **GitHub**: https://github.com/hehua07/clinical-assist-system
+
+⚠️ **双写维护规范（2026-07-21 session 29 reconcile 后立）**：活跃技能目录 `~/.hermes/skills/<name>` 与本仓目录 `~/hermes-clinical-assist-skills/<name>` 是**两份独立拷贝**（非软链），已发生过双写分叉。固定流程：①一律先改活跃侧（skill_manage/patch 的生效侧）②推送前 `diff -rq ~/.hermes/skills/<name> ~/hermes-clinical-assist-skills/<name>` 逐技能核对 ③确认活跃侧为超集后 `rsync -a --delete 活跃侧/ 仓侧/`（历史经验：活跃侧始终最新；若仓侧出现活跃侧没有的独有内容，先人工合并再 rsync，禁止盲删）④仓内 `git add -A && git commit && git push origin master`。
 
 包含 5 个 Skill（2026-07-19 推送）：`clinical-assist-system`、`rag-repair-lessons`、`aliyun-nginx-proxy-location`、`remote-server-config`、`hermes-env-provider-troubleshooting`。其他 Hermes 实例安装：
 ```bash
@@ -632,7 +635,7 @@ CLINICAL_SESSION_HOURS=12
 ### 2026-07-21 (session 29 - 六需求全量实测闭环 + 病历向量化启动 + 双仓提交)
 - **生效契机**：今晨 09:00 机器重启，systemd 用户服务自动拉起 rag-service，session 27/28 落盘代码全部载入——"待重启"状态由开机自动解决
 - **冒烟实测（全部通过）**：①前端 5 标志串 grep 全中（出院小结/指南对齐渲染/关联操作/来源网站/代入患者病情）②quick 15.2s 返回 guideline_refs=2（胆石症共识2025+胆囊炎共识2025）、dip 3 条带推荐附加操作 ③detail 17.3s 药占比核算（215元/18.6%）+控费标杆测算（1774.31分×0.65299≈1158元）+病程 184 字+医嘱 8 条 ④出院小结 4.6s 七字段+公众号尾注 ⑤指南检索带年份/来源字段
-- **需求5 启动**：`ingest_emr_records.py` 后台跑批（EMR 四类文书近24个月 → `emr_cases` 集合，断点续跑）；`.gitignore` 增加 `emr_ingest_state.json`。**首跑 ORA-01722 修复**：EMR.ID 是 VARCHAR2 字母数字混编（如 `0G3VI0JE5UUHQN8P`），非数字——`ID > :int` 触发隐式 TO_NUMBER 全表转换报错；且 Oracle 空串=NULL（`ID > ''` 永远无行），首轮分页须在 SQL 层省略 `ID > :6` 条件。修复：字符串键控分页 + 条件 SQL，冒烟 50 文档/191 块通过后全量启动
+- **需求5 启动**：`ingest_emr_records.py` 后台跑批（EMR 四类文书近24个月 → `emr_cases` 集合，断点续跑）；`.gitignore` 增加 `emr_ingest_state.json`。**首跑 ORA-01722 修复**：EMR.ID 是 VARCHAR2 字母数字混编（如 `0G3VI0JE5UUHQN8P`），非数字——`ID > :int` 触发隐式 TO_NUMBER 全表转换报错；且 Oracle 空串=NULL（`ID > ''` 永远无行），首轮分页须在 SQL 层省略 `ID > :6` 条件。修复：字符串键控分页 + 条件 SQL，冒烟 50 文档/191 块通过后全量启动。**跑批完成**：10,195 份文书 → **38,293 块**（139.9 分钟），检索实测（胆囊结石查询命中手术记录单）通过。⚠️ emr_cases 尚未接入任何推理端点（纯数据资产，接入需另改代码重启）
 - **技能双写 reconcile**：逐一 diff 五个技能确认活跃侧全为仓侧超集（session 27 前半仓侧内容已含于活跃侧），rsync 活跃→仓后推 master；rag-service 推 main
 - **指南注入链路确认**：`_guideline_context()`（L2400）检索→文档去重→阈值0.58→top2×550字摘录注入 quick/detail prompt；系统提示词【指南对齐】条款要求引用注明指南名+年份；失败静默降级不拖垮分析；refs 只回元数据（摘录仅进 prompt 是设计如此）
 
