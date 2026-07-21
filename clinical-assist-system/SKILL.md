@@ -1,7 +1,7 @@
 ---
 name: clinical-assist-system
 description: "寿县和华医院临床AI辅助系统（RAG + vLLM + DIP匹配）的调试记录、当前状态、已知问题和修复方案。任何智能体对系统进行修改后，必须更新此技能。"
-version: 1.16.1
+version: 1.17.0
 author: hehua
 platforms: [linux, macos, windows]
 ---
@@ -15,7 +15,7 @@ platforms: [linux, macos, windows]
 | vLLM | ✅ 运行 | Qwen3-32B-NVFP4, :8200, max-model-len=16384, **prefix caching 已启用** |
 | RAG服务 | ✅ 运行 | :18790, systemd用户服务(开机自启), 路径 /home/hehua/rag-service.bak/ |
 | Ollama | ✅ 运行 | :11434, qwen3-embedding (v0.32.1, **GPU模式**) |
-| ChromaDB | ✅ 运行 | dip_rules=4481, settlement_2025=4704, **guidelines=3192（138篇·治理版v3；session 27 注入 /clinical/assist 推理链，session 29 实测生效：quick/detail 自动对齐 top2 指南并返回 guideline_refs）**, compliance=4, tcm_knowledge=3438, **emr_cases=38293（10195份文书·session 30 已接入推理链：quick/detail 注入 top3 相似病历并返回 emr_case_refs）** |
+| ChromaDB | ✅ 运行 | dip_rules=4481, settlement_2025=4704, **guidelines=3171（132篇·治理版v3；session 27 注入推理链，session 31 事故重建后 web 为源每日同步，local_url 绝对化）**, compliance=4, tcm_knowledge=3438, **emr_cases=38293（10195份文书·session 30 已接入推理链：quick/detail 注入 top3 相似病历并返回 emr_case_refs）** |
 | LLM引擎 | 🌐 DeepSeek在线（主） | `RAG_LLM_PROVIDER=online`（.env），DeepSeek→GLM→本地vLLM自动降级 + 调用前脱敏；回切本地改 .env 一行重启。实测 quick 6s/detail 7s |
 | 前端页面 | ✅ 全部正常（2026-07-20 session 19 再修复 /report/） | `https://www.hhysjt.com/clinical/`、`/guideline/search`、`/guidelines/`、`/report/` 公网全部 200，HTTP→HTTPS 301 正常。修复：SSH 直连（公钥已装）+ 本地构建 + scp 上传 hhysjt.conf（基于 bak4 + 收回悬空 location + 新增 /guideline 反代）→ nginx reload。**此后阿里云操作走 SSH 不再走 Workbench**，见 aliyun-nginx-proxy-location skill |
 | dip_operations | ✅ 正常 | 淮南分值库操作列表(20+条)，按分值降序 |
@@ -140,6 +140,8 @@ journalctl --since "today" | grep "Scheduled restart" | head -10
 | Oracle EMR 数据模型 | `references/emr-data-model.md` | 病历批量向量化摸底（2026-07-21）：EMR+EMR_ELEMENT 文书中心、各表行数/近一年量/文本长度、DRG_UPLOAD_HN_* 已停更、出院小结存在性、脱敏字段清单、批量导出路径 |
 | 加选无数据 RCA | `references/operation-reselect-empty-rca.md` | 选用按钮后参考列表空的根因（description 检索锚点丢失 + x 诊断码正则失效）、A/B 实测证据、修复建议、登录态直调端点复现法（2026-07-21 只读分析，未修复） |
 | Oracle HIS 查询陷阱 | `references/oracle-his-query-pitfalls.md` | EMR.ID 是 VARCHAR2 字母数字混编（ORA-01722 隐式 TO_NUMBER）；Oracle 空串=NULL 致分页首轮静默 0 行（条件 SQL 写法）；写查询前先探 ALL_TAB_COLUMNS 列类型 |
+| 推理链接入配方 | `references/inference-chain-integration.md` | 新向量集合入推理链标准做法（guidelines/emr_cases 两例验证）：建库绑 EF、阈值实测标定、文档去重+静默降级、prompt 条款边界、refs 两渲染路径、正/负例+公网 cookie 冒烟 |
+| Chroma段损坏重建 | `references/chromadb-segment-corruption-rebuild.md` | guidelines 集合 HNSW 段损坏（sqlite 完好但读取段错误）的三辨诊断法 + 以站为源全量重建流程 + sync_guidelines_from_web.py 用法（2026-07-21 晚实录） |
 
 ### 2. 讯飞Spark API Key 授权失效
 - **报错**: `AppIdNoAuthError (code=11200)`
@@ -403,6 +405,7 @@ nohup /usr/bin/python3 -m vllm.entrypoints.openai.api_server \
 | 病种驱动管线 | `/home/hehua/guidelines_scraper/disease_pipeline.py` | ✅ session 23 新建，见下节 |
 | 向量化导入 v3 | `/home/hehua/guidelines_scraper/import_knowledge_base_v3.py` | ✅ 当前用：读 curated 产物、块级全局去重、800字分块重叠100 |
 | 治理脚本 | `/home/hehua/guidelines_scraper/curate_guidelines.py` | ✅ 2026-07-21 新建：时效/版本/择优/清洗/展示页，见管线参考文档末节数据坑 |
+| 网站为源同步 | `/home/hehua/guidelines_scraper/sync_guidelines_from_web.py` | ✅ session 31 新建（需求4b）：抓 display 页→clean_for_vector→哈希增量 upsert；删 web_sync_state.json=全量重建；单进程纪律，跑前整库备份 |
 | 合规文档 | `/home/hehua/guidelines_scraper/compliance/` | 4 篇 |
 
 ### 病种驱动指南管线（需求4，session 23 建成）
@@ -606,7 +609,7 @@ CLINICAL_SESSION_HOURS=12
 - 交付时提醒用户 **Ctrl+F5 强刷**（浏览器缓存改造前旧页会表现为"改了没效果"）
 - "卡住/无反应"排查先分前后端：`journalctl --user -u rag-service.service --since "10 min ago" | grep -E "\[LLM\]|\[TIMER\]|POST"`——无新请求 = 前端没发出；有请求且全 200 = 后端无罪。详见 `references/frontend-analysis-paths.md`
 - **"文档记了 ≠ 修复落盘"（2026-07-20 真实踩坑）**：changelog/skill 声明"修复已生效"之前，必须 grep 目标文件确认补丁真实在盘；跨会话或上下文压缩恢复后，不信既有完成声明，先对盘验证——switchTab 修复曾被 session 19 文档"提前宣布完成"，HTML 实际未改，用户多踩一轮才发现。**反向陷阱（session 22）**：裸关键词计数也会误判——`section-dip` grep 命中 2 处实为死函数里的 getElementById 引用而非元素定义（元素早删了），`mode:'quick'` 计数 0 是漏掉 `mode: 'quick'` 空格变体（补丁其实在）。核对落盘要用 `id="xxx"` 元素定义级模式 + 空白容差正则（`mode: *'quick'`），并区分"元素定义/函数定义/调用点"三种命中
-- 重启后**线上验证才算交付**：`curl -s https://www.hhysjt.com/clinical | grep -c "<新增代码标志串>"` 计数 ≥1 才可汇报（本地文件改了 ≠ 内存页更新 ≠ 公网可达）
+- 重启后**线上验证才算交付**：`curl -s https://www.hhysjt.com/clinical | grep -c "<新增代码标志串>"` 计数 ≥1 才可汇报（本地文件改了 ≠ 内存页更新 ≠ 公网可达）。**需登录页面的公网验证两个坑**（session 30 实测）：①cookie 按域名隔离——本机 127.0.0.1 登录的 cookie 不会发给 www.hhysjt.com，须向 `https://www.hhysjt.com/login` 重新 POST 取 cookie；②curl 加 `-L` 跟 307（/clinical/→/clinical 去尾斜杠），否则拿到空响应误判未生效
 - 用户报"某按钮没用"三步审计：①grep 全部 `onclick="..."` 与对应 `function` 定义配对（死按钮检测）②curl 各按钮的后端接口看 HTTP 码+耗时 ③按上条 journalctl 分辨请求是否到达后端
 - **HTML 改动批量做、一次重启，重启前先打招呼**（2026-07-20 踩坑）：页面缓存于 `_CLINICAL_PAGE` 内存，任何 HTML 改动都要 `systemctl --user restart rag-service.service` 才生效；而 restart 命令需终端批准，用户常在微信端操作看不到 TUI 批准请求 → 超时阻断（当晚会话连续被拦两次，修复差点交付不出去）。规范：所有 HTML 补丁全部落盘 + readback 验证后，再发起唯一一次重启；重启前先微信告知"需在终端批准，或回复继续"。**扩展到一切需批准的命令**（session 22 踩坑）：`.env` 写入、`py_compile`、curl POST 冒烟同样触发批准 gate 且 60s 无人点即拒——把它们与重启合并为最后一整条命令一次批准，分散发起会被逐个超时拒掉；被拒后不得换壳重试同一结果，只能等用户回来。**session 27 补充**：①gate 触发无稳定规律——`python3 -c` 与 heredoc 均曾被拦（session 26 观察到的"heredoc 免批准"不可依赖），唯一可靠姿势仍是攒批+提前打招呼；②被拦期间 patch/write_file/search_files/skill_manage/cronjob 均不走 gate，可继续纯文件落盘，执行类动作顺延；③工具空响应后补丁可能实际已执行（幻影执行），一切补丁写幂等、重跑前先 grep 对盘再决定
 - **自动填充防覆盖模式**（prefillTCM 实例，2026-07-20）：代入患者数据的输入框，把上次自动填充值存 `window._xxxPrefilled`；再填前比对 `ta.value !== window._xxxPrefilled` → 医师手动改过就不覆盖（force 按钮除外）。代入内容**不含患者姓名**（具名信息不进在线 LLM 链路，脱敏正则不处理中文人名），只放性别/年龄/就诊类型/科室
@@ -631,6 +634,14 @@ CLINICAL_SESSION_HOURS=12
 4. **验收**：`git diff` 全量审查 + `py_compile`（Python）→ 按「修改规范」批量一次重启 → 公网 curl grep 标志串 ≥1 → 微信汇报。**opencode 的产出同样受上方「修改规范」全部条款约束**（改前备份、readback 落盘验证、遮罩泄漏检查、线上验证才算交付）。
 
 ## Changelog
+
+### 2026-07-21 (session 31 - 四项新需求全量落地 + guidelines 段损坏重建，代码均已提交)
+- **需求1+2（首次病程升级+内容丰富化）已上线冒烟通过**：QUICK fcr `鉴别诊断`→`诊断和鉴别诊断`（首行主/第二/第三诊断逐行列，无则不写；随后融入鉴别分析，与 possible_conditions 呼应）；fcr 各段写足写实（病例特点5-8句/诊断依据3-5条/诊疗计划4-6条）；DETAIL 病程 100-200字→300-500字；max_tokens quick 2600→3200、detail 3000→3400；前端 renderFCR 键序更新+旧键兼容回填。实测：quick 18s 三诊断+6鉴别疾病融入、病例特点211字；detail 17s 病程482字
+- **需求3 全文覆盖审计+剔除**：139 篇中 8 篇无全文/非指南（医院新闻稿/期刊导航页/医师报新闻/患者教育单页/4篇抓取残缺）——`curate_guidelines.py` 加 `JUNK_FILES`（按原始文件 URL 哈希精确排除，过滤阶段剔除不入家族竞选）；**同族全文版自动扶正**：痔病→团体标准痔中西结合诊疗指南2025（44k字全文）+痔病2020完整版、胆道感染→2021版指南（7073字）；结直肠息肉2025/癌前病变/肩周炎 无全文版下架待重抓。保留 139→132 篇
+- **需求4a 展示页微信分享化+上站**：DISPLAY_TMPL 加 og:title/og:description/description + canonical 绝对链 + **gd- year/publisher/journal/url/kept/family 机器可读 meta**（web→向量同步自描述）；孤儿展示页清理 26 个；rsync --delete 上站实测 index 200（132篇）、新模板 meta 齐、垃圾页 404
+- **需求4b 网站为源统一同步+cron**：`sync_guidelines_from_web.py`——抓 index→逐页 gd-meta+article→剥 frontmatter→`clean_for_vector` 清洗→md5 增量；变更页删旧块（相对/绝对 local_url 双形态）→800/100 分块→qwen3-embedding→upsert（**absolute local_url**，原文链接可直接微信打开）；网站消失页→按 local_url 扫库删向量；state=web_sync_state.json 逐页落盘；flock 单实例锁；**collection 用 get_or_create 且必须带 `hnsw:space: cosine`**；中文文件名 URL 必须 `urllib.parse.quote`。cron `4da787a0f65d`（每日04:10，no_agent 包装器 `~/.hermes/scripts/guidelines_web_sync.sh`，deliver=all，无变更静默）
+- **⚠️ guidelines 集合段级损坏事故**：4 个幻影并发同步进程+pkill -9 中断写 → 集合读取即 SIGSEGV（chromadb 1.5.9 Rust 后端 `_count`）；sqlite integrity 完好、其余集合正常、段 bin mtime=杀戮窗口 = HNSW 段撕裂。处置：整库 cp -a 备份 5.9G→`delete_collection`（不触发段加载，安全）→重建（cosine metadata）→全量 web 同步 15 分钟 132页/3171块 0 失败。完整取证 `references/chromadb-segment-corruption-rebuild.md`；rag-repair-lessons §20。**教训：chroma 同库多写进程必坏；幻影执行叠命令后先 pgrep 核实进程数再动手**
+- **重建后验证**：3171块/cosine/检索胆囊查询 dist=0.307 命中胆石症共识/absolute local_url ✓；**rag-service 重启绑新集合待用户审批**（`coll_guidelines` 为 init 期缓存句柄，集合 delete→recreate 后旧句柄失效，指南注入静默降级中；重启审批超时用户不在场，用户回来一句话即可重启）
 
 ### 2026-07-21 (session 30 - 需求5接入：相似病历入推理链，已上线公网)
 - **功能**：`_emr_cases_context()`（rag_service.py L2442）——检索 emr_cases（n=12）→按 emr_id 去重→**距离阈值 0.65**（实测标定：覆盖内 0.45-0.58、覆盖外 ≥0.72）→top3×500字摘录注入 `/clinical/assist` quick/detail prompt；QUICK/DETAIL 系统提示词各加【相似病历参考】条款（思路/格式参考，不替代指南与临床判断）；响应带 `emr_case_refs`（doc_type/emr_date/dept/diagnoses/relevance/snippet150字）；前端 `renderEmrCaseRefs`（关键提醒区"📁本次分析参考的本院相似病历"），quick/detail 两渲染路径均挂接

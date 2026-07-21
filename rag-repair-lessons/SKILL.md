@@ -1,7 +1,7 @@
 ---
 name: rag-repair-lessons
 description: "RAG临床辅助系统反复故障的根因分析与修复经验，包括max_tokens截断、timeout不一致、备份版本混乱、json解析鲁棒性等教训。任何智能体在处理RAG相关问题时，必须先加载本技能。"
-version: 1.5.0
+version: 1.7.0
 author: hehua
 platforms: [linux]
 ---
@@ -16,6 +16,27 @@ platforms: [linux]
 
 ## 已知故障根因
 
+### 20. ChromaDB 集合段级损坏：sqlite 完好但读取即段错误（2026-07-21 晚确诊）⚠️
+
+- **症状**: 某集合（guidelines）一读取就 `Fatal Python error: Segmentation fault`（exit 139，核心转储），栈顶在 `chromadb/api/rust.py` 的 `_get`；`count()`/`get()` 均崩。rag-service `/health` 报 `{"status":"error","detail":"Collection [uuid] does not exist."}`，但服务进程活着、其余集合正常
+- **根因**: **HNSW 向量段文件损坏**（`chroma_data/<VECTOR段uuid>/data_level0.bin` 等，本次为并发同步进程 + pkill 中断写所致），**不是** sqlite 层损坏
+- **诊断三辨（顺序执行，缺一不可）**:
+  1. `sqlite3 "file:.../chroma.sqlite3?mode=ro" "PRAGMA integrity_check;"` → `ok` = 元数据层完好
+  2. 其余集合 `count()` 正常 = 损坏是集合级而非实例级
+  3. `SELECT c.name,s.id,s.scope FROM segments s JOIN collections c ON s.collection=c.id` 找到 VECTOR 段 uuid，`ls -la` 该目录 bin 文件 mtime 落在事故窗口 = 实锤
+- **与第 13/19 节的鉴别**: 13 重启即好（进程态）；19 启动崩溃循环 + journal 有 ValueError（EF 配置不一致）；本节**重启后读取仍崩**（数据段坏），三者信号链完全不同
+- **修复（实测通过）**: ①`cp -a chroma_data` 整库冷备份（先确认磁盘）②`delete_collection()`（sqlite 层完好，删除可执行）③重建脚本必须 `get_or_create_collection(embedding_function=ef, metadata={"hnsw:space":"cosine"})`——**丢 cosine 则 0.58 检索阈值体系全废**（指南），丢 EF 则踩第 19 节 ④删同步 state 文件全量重建 ⑤验证 health 恢复 + 块数对基准（3192/138 篇）+ 冒烟
+- **过渡期预期**: 重建完成前 health 报 Collection does not exist 属**正常**，其余集合功能不受影响——不要见此就重启服务或回滚
+- **预防**: 批量写 chroma 的脚本跑前整库 `cp -a` 备份；同步类脚本单进程纪律（`pgrep -f` 会把 bash 包装层计入计数，用 `ps aux | awk` 看真实进程）；中断后下次跑前先按三辨抽检。完整实录：clinical-assist-system `references/chromadb-segment-corruption-rebuild.md`
+
+### 19. 新集合注册即启动崩溃循环：ChromaDB 嵌入函数冲突（2026-07-21 确诊）⚠️
+
+- **症状**: rag_service.py 给 VectorStore 注册一个新集合后重启，服务 `activating (auto-restart)` 崩溃循环、health 永远起不来；journal 报 `ValueError: An embedding function already exists in the collection configuration... Embedding function conflict: new: ollama vs persisted: default`
+- **根因**: 该集合由独立跑批脚本创建时**未传 embedding_function** → chroma 持久化 EF=default；服务端通用 `_get_coll`（带 ollama EF）`get_or_create_collection` 同一集合 → chroma 校验持久化 EF ≠ 传入 EF，异常在 FastAPI lifespan 启动期抛出 → 启动失败。`Restart=always` 把一次性错误放大成无限崩溃循环
+- **修复（消费端兼容路径）**: `client.get_collection(name)` 不带 EF 取集合（不触发校验），查询点显式嵌入：`coll.query(query_embeddings=vs.ef([query]), n_results=N)`——不能走 `query_texts`（无 EF 可用）。嵌入模型必须与建库时相同
+- **预防（创建端铁律）**: 任何脚本 `get_or_create_collection` 必须传 `embedding_function=ef`（+ `metadata={"hnsw:space":"cosine"}` 与服务端一致）——创建时绑好 EF，消费端才能走通用 `_get_coll` + `query_texts` 路径，不留兼容尾巴
+- **与第 13 节的鉴别**: 13 是运行时状态损坏，重启即好；本节是代码/数据配置不一致，**重启永远复现**，必须改代码。信号链：最近一次改动加了新集合注册 + 重启循环 + journal 有 ValueError = 本模式
+
 ### 17. 工具空响应 ≠ 未执行：叠加盲改把文件改烂（2026-07-21 真实踩坑）⚠️
 
 - **症状**: patch/terminal 工具返回"空输出"，以为没执行就换方式再改——实际命令已生效。多轮"重试"把同一编辑应用 4-5 份，随后一次"修复性"行区间删除（`del lines[451:504]`）把 530 行脚本截成 416 行、无 git 无 cp 备份，只能凭会话上下文重建尾部
@@ -26,6 +47,7 @@ platforms: [linux]
   3. **脚本化批量编辑前先 `cp file file.bak.$(date +%Y%m%d_%H%M%S)`**——修改规范第1条同样适用 guidelines_scraper/ 等无 git 的工具脚本，不只 rag_service.py
   4. 多轮 patch 同一文件后跑 `grep -c "关键行"` 查重复应用（期望 1 次实测 N 次 = 已叠加）
   5. 长脚本编辑中断（上下文压缩/崩溃）恢复后，先 `py_compile` + 行数比对再续，不信记忆里的文件状态
+  6. **execute_code 通道同样中招**（2026-07-21 晚第二例）：`hermes_tools.patch` 空响应后重发，同一 `import urllib.parse` 被叠加 8 份、`def fetch` 被嵌套成 def-in-def 语法错误。检测签名：`grep -c "^import urllib.parse" file` 期望 1 实测 8。清理修复后**全文件 py_compile + 通读 import 区**再继续
 
 ### 18. "不卡死但返回无数据"：重分析请求丢了检索锚点（2026-07-21 确诊，未修复）⚠️
 
@@ -385,6 +407,9 @@ tail -3 ~/.hermes/logs/gateway.log
 - **新增**: 第11节 \"跨机器操作\" — hermes send -t weixin 发命令到用户微信
 
 ### 2026-07-21
+- **新增**: 第20节 "ChromaDB 集合段级损坏：sqlite 完好但读取即段错误" — 并发写+pkill 中断致 HNSW 段 bin 损坏；三辨诊断法（sqlite ok/他集合正常/段文件 mtime）；修复=整库备份→delete_collection→get_or_create 带 cosine metadata→全量重建；过渡期 health 报错属正常；与 13/19 节鉴别
+- **第17节补充**: 第 6 条——execute_code/hermes_tools.patch 通道同样发生空响应叠加（import ×8 + def 嵌套实例），检测签名与清理流程
+- **新增**: 第19节 "新集合注册即启动崩溃循环：ChromaDB 嵌入函数冲突" — 跑批脚本建集合未绑 EF（persisted=default）+ 服务端带 EF get_or_create = lifespan 启动抛 ValueError 崩溃循环；修复=get_collection 免EF+query_embeddings 显式嵌入；预防=创建端必须绑 EF；与第13节"重启即好"的鉴别
 - **新增**: 第18节 "不卡死但返回无数据：重分析请求丢了检索锚点" — 选用加选后参考列表空的根因（payload 写死空 description + x 诊断码正则失效，条件性触发）；登录态 A/B 直调诊断法；"二次请求必须带首次锚点"等四条教训
 - **新增**: 第17节 "工具空响应≠未执行，叠加盲改把文件改烂" — 指南库治理脚本截断事故的铁律（查磁盘真相/禁盲删行区间/脚本先备份/重复应用检测/压缩恢复后先编译再续）
 
