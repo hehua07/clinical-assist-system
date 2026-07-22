@@ -20,7 +20,7 @@ platforms: [linux, macos, windows]
 | 前端页面 | ✅ 全部正常（2026-07-20 session 19 再修复 /report/） | `https://www.hhysjt.com/clinical/`、`/guideline/search`、`/guidelines/`、`/report/` 公网全部 200，HTTP→HTTPS 301 正常。修复：SSH 直连（公钥已装）+ 本地构建 + scp 上传 hhysjt.conf（基于 bak4 + 收回悬空 location + 新增 /guideline 反代）→ nginx reload。**此后阿里云操作走 SSH 不再走 Workbench**，见 aliyun-nginx-proxy-location skill |
 | dip_operations | ✅ 正常 | 淮南分值库操作列表(20+条)，按分值降序 |
 | settlement_operations | ✅ 正常 | 结算参考数据(2-3条) |
-| 登录鉴权 | ✅ 已上线（session 22） | HMAC签名会话Cookie+登录页；`/clinical*` `/patients/` `/query` `/counts` `/ingest_*` `/sync/` `/compliance/`(除query) 需登录，患者自查与指南库开放。账号在 .env `CLINICAL_USERS`（凭据不入库），设计见「医师端登录鉴权」节 |
+| 登录鉴权 | ✅ 已上线（session 22） | HMAC签名会话Cookie+登录页；`/clinical*` `/patients/` `/query` `/counts` `/ingest_*` `/sync/` `/compliance/`(除query) 需登录，患者自查与指南库开放。账号在 .env `CLINICAL_USERS`（凭据不入库），设计见「医师端登录鉴权」节。2026-07-22 起 = 主账号 + hehua01–06 六个测试账号；防爆破锁改按 XFF 真实 IP（session 32） |
 | 语音输入 | ✅ 已上线（session 23） | 浏览器 MediaRecorder → `POST /clinical/transcribe` → SenseVoice Small int8（sherpa-onnx，纯 CPU，加载 0.6s，5.6s 音频 0.09s 出结果）。模型在 `~/rag-service.bak/models/sense-voice/`（237MB，已入 .gitignore 勿提交）。弃用 Web Speech API 的原因：国内浏览器不可用 |
 | 网站巡检 | ✅ 已上线（session 23） | cron `739bd07f80b9` 每5分钟跑 `~/.hermes/scripts/hhysjt_watchdog.py`（9项：RAG/vLLM/Ollama/frp/公网四端点/磁盘），全绿静默、异常/恢复推微信（deliver=all，no_agent） |
 
@@ -612,13 +612,14 @@ CLINICAL_SESSION_HOURS=12
 - 重启后**线上验证才算交付**：`curl -s https://www.hhysjt.com/clinical | grep -c "<新增代码标志串>"` 计数 ≥1 才可汇报（本地文件改了 ≠ 内存页更新 ≠ 公网可达）。**需登录页面的公网验证三个坑**：①cookie 按域名隔离——本机 127.0.0.1 登录的 cookie 不会发给 www.hhysjt.com，须向 `https://www.hhysjt.com/login` 重新 POST 取 cookie；②curl 加 `-L` 跟 307（/clinical/→/clinical 去尾斜杠），否则拿到空响应误判未生效；③**`/login` 只解析 JSON body**（`await request.json()`，session 31 实测踩坑）——冒烟必须 `curl -X POST /login -H 'Content-Type: application/json' -d '{"username":"..","password":".."}'`；表单式 `-d "username=..&password=.."` 会静默 401（body 解析失败→空 data→账号密码不匹配）
 - 用户报"某按钮没用"三步审计：①grep 全部 `onclick="..."` 与对应 `function` 定义配对（死按钮检测）②curl 各按钮的后端接口看 HTTP 码+耗时 ③按上条 journalctl 分辨请求是否到达后端
 - **HTML 改动批量做、一次重启，重启前先打招呼**（2026-07-20 踩坑）：页面缓存于 `_CLINICAL_PAGE` 内存，任何 HTML 改动都要 `systemctl --user restart rag-service.service` 才生效；而 restart 命令需终端批准，用户常在微信端操作看不到 TUI 批准请求 → 超时阻断（当晚会话连续被拦两次，修复差点交付不出去）。规范：所有 HTML 补丁全部落盘 + readback 验证后，再发起唯一一次重启；重启前先微信告知"需在终端批准，或回复继续"。**扩展到一切需批准的命令**（session 22 踩坑）：`.env` 写入、`py_compile`、curl POST 冒烟同样触发批准 gate 且 60s 无人点即拒——把它们与重启合并为最后一整条命令一次批准，分散发起会被逐个超时拒掉；被拒后不得换壳重试同一结果，只能等用户回来。**session 27 补充**：①gate 触发无稳定规律——`python3 -c` 与 heredoc 均曾被拦（session 26 观察到的"heredoc 免批准"不可依赖），唯一可靠姿势仍是攒批+提前打招呼；②被拦期间 patch/write_file/search_files/skill_manage/cronjob 均不走 gate，可继续纯文件落盘，执行类动作顺延；③工具空响应后补丁可能实际已执行（幻影执行），一切补丁写幂等、重跑前先 grep 对盘再决定
+- **跨会话续跑先对账已有产物再动手建设**（session 31 收尾踩坑）：上下文压缩/中断续跑时，前序会话可能已部分完成"待办清单"——动手前 `cronjob list` + `git log --oneline -5` + SKILL.md 最新 changelog 三方核对。本轮不知前序已建每日同步 cron（04:10）且已写进 changelog，重复建了 03:30 任务后才察觉删除；同样地，前序已提交的代码改动不要重复打补丁（先 git status/diff 看工作区状态）
 - **自动填充防覆盖模式**（prefillTCM 实例，2026-07-20）：代入患者数据的输入框，把上次自动填充值存 `window._xxxPrefilled`；再填前比对 `ta.value !== window._xxxPrefilled` → 医师手动改过就不覆盖（force 按钮除外）。代入内容**不含患者姓名**（具名信息不进在线 LLM 链路，脱敏正则不处理中文人名），只放性别/年龄/就诊类型/科室
 - **用户产品原则（2026-07-20 原话"把不能用的按钮取消，避免医师选错"）**：对医师暴露的 UI 宁缺毋滥——功能不确定能用就先隐藏/撤下，不留半成品按钮给医师误点。交付新按钮前必须自己先端到端点过一遍
 - **遮罩泄漏检查（2026-07-20 确诊）**：`grep -n "loadingIndicator" page.html`，每个 `classList.add('active')` 必须在成功/失败/异常全路径有配对 `remove`（finally 最保险；`.then().catch()` 两条链都要补）。漏 remove → 请求 200、结果已渲染，但全屏转圈永盖页面 = 用户报"卡住"。**日志全绿 + 页面停在转圈 = 遮罩泄漏，不是后端卡**
 - **静默守卫要配反馈**：函数顶部 `if (!x) return;` 命中时不转圈不报错 = "点击完全没反应"。加守卫顺手加 toast/error 提示
 - **服务依赖必须用服务自己的解释器安装**（2026-07-20 session 23 踩坑，bs4/sherpa-onnx 连踩两次）：Hermes 终端 PATH 里的 `pip3`/`python3` 指向 **hermes-venv**，而 rag-service 的 systemd `ExecStart` 是 `/usr/bin/python3`——裸 `pip3 install` 把包装进 venv，服务依旧 ImportError 且不易察觉。一律 `/usr/bin/python3 -m pip install --break-system-packages <pkg>`，并用同一解释器 `import` 验证。通则：给哪个进程装依赖，就用哪个进程的解释器装+验
 - **术语对齐再动手**：用户说的「二次分析」= 更改主诊断/主操作后的重新分析（🔄 重新分析/选用按钮），不是结果页底部 🔍 detail 按钮。页面有多个相似入口时先让用户指认具体按钮再排查——词义没对齐，排查方向就错（首轮误判为浏览器缓存，白走一轮）
-- **接口冒烟先 dump 原始响应再写解析**（session 23 白烧两轮）：`/health` 是**顶层平铺键**（`"guidelines": 2221`），不是嵌套 `collections` 对象；`/guideline/search` 返回 `{diagnosis, answer, sources}`，不是 `results` 数组。凭猜测写 JSON 解析 = 假阴性（数据一直在，解析输出全空，差点误判成"集合句柄坏了"）。新端点第一发 curl 直接看响应全文，第二发才写解析/断言
+- **接口冒烟先 dump 原始响应再写解析**（session 23 白烧两轮）：`/health` 是**顶层平铺键**（`"guidelines": 2221`），不是嵌套 `collections` 对象；`/guideline/search` 返回 `{diagnosis, answer, sources}`，不是 `results` 数组。凭猜测写 JSON 解析 = 假阴性（数据一直在，解析输出全空，差点误判成"集合句柄坏了"）。新端点第一发 curl 直接看响应全文，第二发才写解析/断言。**补充（session 31 收尾踩坑）：HTTP 200 但毫秒级秒回 = 入参校验失败**，不是成功——`/clinical/assist` 必填字段是 `description`（不是 chief_complaint/history/vitals），缺失时 0.00x s 返回 `{"error":"请提供病情描述或患者信息"}`；冒烟看到 200 先核对耗时是否合理（quick 正常 12-18s），秒回必读响应体
 
 ## opencode 协同开发工作流（2026-07-20 确立，用户批准的分工模式）
 
@@ -634,6 +635,13 @@ CLINICAL_SESSION_HOURS=12
 4. **验收**：`git diff` 全量审查 + `py_compile`（Python）→ 按「修改规范」批量一次重启 → 公网 curl grep 标志串 ≥1 → 微信汇报。**opencode 的产出同样受上方「修改规范」全部条款约束**（改前备份、readback 落盘验证、遮罩泄漏检查、线上验证才算交付）。
 
 ## Changelog
+
+### 2026-07-22 (session 32 - 双终端登录排查 + 6测试账号 + 防爆破锁按真实IP)
+- **"同账号双终端，后登录终端推理失败"根因查明**：①主因=7-21 22:27 重启的进程跑的是 session 31 公网登录修复前的旧代码（修复 22:49 才随重启载入），第二终端被 302 到 `/clinical/login` 却收 401（旧代码无豁免/别名路由），连登录页都进不去——22:49 起已自愈；②鉴权是无状态 HMAC cookie，本就支持同账号多终端并存（无互踢机制），本次实测验证通过（顺序+并发均 200）
+- **潜在缺陷修复**：防爆破锁原按 `request.client.host` 计数，反代后公网终端全是 127.0.0.1 → 任一终端连续失败 5 次会把全部公网终端一起锁 5 分钟。修复：`_client_ip()` 优先取 X-Forwarded-For 首跳；阿里云 nginx /clinical 块补传 XFF/X-Real-IP 并 reload
+- **6 个测试账号上线**：.env `CLINICAL_USERS` = 主账号 hehua + hehua01–hehua06（密码见 .env，生产部署时换强密码；凭据不入库/不入技能）。⚠️账号表变更→派生 secret 变化→**全部旧会话失效**，各终端需重新登录一次
+- **实测（全部通过）**：3 cookie 罐模拟终端——hehua01 双"终端"顺序推理全 200（16-19s）、同账号并发推理双双 200（18-22s，analysis/guideline_refs/emr_case_refs 结构完整）；hehua02 正常；公网 hehua03 登录+推理 200（21.6s）；未登录 401、错密码 401
+- 备份 `.env.bak.20260722_081130` / `rag_service.py.bak.20260722_081130` / 阿里云 `hhysjt.conf.bak.20260722_081130`
 
 ### 2026-07-21 (session 31 - 四项新需求全量落地 + guidelines 段损坏重建，代码均已提交)
 - **需求1+2（首次病程升级+内容丰富化）已上线冒烟通过**：QUICK fcr `鉴别诊断`→`诊断和鉴别诊断`（首行主/第二/第三诊断逐行列，无则不写；随后融入鉴别分析，与 possible_conditions 呼应）；fcr 各段写足写实（病例特点5-8句/诊断依据3-5条/诊疗计划4-6条）；DETAIL 病程 100-200字→300-500字；max_tokens quick 2600→3200、detail 3000→3400；前端 renderFCR 键序更新+旧键兼容回填。实测：quick 18s 三诊断+6鉴别疾病融入、病例特点211字；detail 17s 病程482字
@@ -719,7 +727,7 @@ CLINICAL_SESSION_HOURS=12
   - **保护路径**：`/clinical*`（页面+assist+tcm+patients+doctors+departments+patient-summary）、`/patients/*`、`/query`、`/counts`、`/ingest_*`、`/sync/*`、`/compliance/{visit_id}`。未登录：页面 302→/login，API 401 JSON
   - **保持开放**：`/health`、`/wechat*`、`/api/search-id6`、`/lab-results`、`/reports`、`/imaging-results`、`/all-reports`、`/guideline/*`、`/compliance/query`（患者自查+指南知识库不受影响）
   - **账号配置**在 `.env`：`CLINICAL_AUTH_ENABLED=1`、`CLINICAL_USERS=账号1:密码1,账号2:密码2`（多账号逗号分隔）、`CLINICAL_SESSION_HOURS=12`。当前账号 `hehua`（初始密码用户已知，可自行改 .env）。未配 CLINICAL_AUTH_SECRET 时由账号表派生 secret（改账号表=全部会话失效）
-  - **防爆破**：同 IP 连续失败 5 次锁 5 分钟（内存计数，重启清零）
+  - **防爆破**：按 X-Forwarded-For 首跳真实 IP 连续失败 5 次锁 5 分钟（内存计数，重启清零）。⚠️2026-07-22 修复：原先按 `request.client.host` 计数，nginx/frp 反代后全是 127.0.0.1，任一公网终端连续失败会把全部公网终端一起锁死——`_client_ip()` 优先取 XFF；阿里云 nginx /clinical 块已补 `proxy_set_header X-Forwarded-For/X-Real-IP`（regex location `~ ^/clinical(/.*)?$` 块内，此前无此头）
   - **前端**：`authFetch()` 包装全部 11 处 fetch，401 统一跳 /login；头部加「⏻ 退出登录」按钮 → /logout 删 cookie
   - **nginx 配套**：阿里云 hhysjt.conf 新增 `location = /login` 和 `location = /logout` 反代 18790（110 行处 sed 插入，`nginx -s reload` 生效，worker 18:52 更新）——⚠️教训：新增 RAG 端点若要走公网，必须同步检查 nginx location 清单，本次公网 404 就是因为只加了后端路由
   - **验证**：本机 7 项 + 公网 7 项全过（登录页200/未登录302/API401/错密码401/登录发cookie/带cookie 200/患者入口开放）；git commit `8c8ff55` 已推 main（rebase 掉 opencode Action 4 个配置提交，分叉清零）
