@@ -141,7 +141,7 @@ journalctl --since "today" | grep "Scheduled restart" | head -10
 | 加选无数据 RCA | `references/operation-reselect-empty-rca.md` | 选用按钮后参考列表空的根因（description 检索锚点丢失 + x 诊断码正则失效）、A/B 实测证据、修复建议、登录态直调端点复现法（2026-07-21 只读分析，未修复） |
 | Oracle HIS 查询陷阱 | `references/oracle-his-query-pitfalls.md` | EMR.ID 是 VARCHAR2 字母数字混编（ORA-01722 隐式 TO_NUMBER）；Oracle 空串=NULL 致分页首轮静默 0 行（条件 SQL 写法）；写查询前先探 ALL_TAB_COLUMNS 列类型 |
 | 推理链接入配方 | `references/inference-chain-integration.md` | 新向量集合入推理链标准做法（guidelines/emr_cases 两例验证）：建库绑 EF、阈值实测标定、文档去重+静默降级、prompt 条款边界、refs 两渲染路径、正/负例+公网 cookie 冒烟 |
-| Chroma段损坏重建 | `references/chromadb-segment-corruption-rebuild.md` | guidelines 集合 HNSW 段损坏（sqlite 完好但读取段错误）的三辨诊断法 + 以站为源全量重建流程 + sync_guidelines_from_web.py 用法（2026-07-21 晚实录） |
+| 合规分析陷阱 | `references/ureteral-stricture-compliance-trap.md` | 输尿管结石/狭窄诊断的DIP合规风险：导引鞘通过≠狭窄、支架≠狭窄、DIP不增分、患者沟通隐患（2026-07-23 王世宣病例实证） |
 
 ### 2. 讯飞Spark API Key 授权失效
 - **报错**: `AppIdNoAuthError (code=11200)`
